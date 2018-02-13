@@ -1,0 +1,11 @@
+node_modules
+dist
+.vscode
+coverage
+**/*.js
+!scripts/*.js
+!example.js
+**/*.js.map
+**/*.d.ts
+.nyc_output
+doc
