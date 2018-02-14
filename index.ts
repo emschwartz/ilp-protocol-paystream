@@ -16,7 +16,8 @@ export interface PaymentSocketOpts {
   peerDestinationAccount?: string,
   peerSharedSecret?: Buffer,
   timeout?: number,
-  sendAddressAndSecret?: boolean
+  sendAddressAndSecret?: boolean,
+  enableRefunds?: boolean
 }
 
 export class PaymentSocket extends EventEmitter {
@@ -38,6 +39,7 @@ export class PaymentSocket extends EventEmitter {
   protected sending: boolean
   protected socketTimeout: number
   protected sendAddressAndSecret: boolean
+  protected enableRefunds: boolean
 
   constructor (opts: PaymentSocketOpts) {
     super()
@@ -61,6 +63,7 @@ export class PaymentSocket extends EventEmitter {
     this.closed = false
     this.sending = false
     this.sendAddressAndSecret = !!opts.sendAddressAndSecret
+    this.enableRefunds = !!opts.enableRefunds
   }
 
   get balance (): string {
@@ -149,6 +152,11 @@ export class PaymentSocket extends EventEmitter {
     this.emit('incoming_chunk', request.amount.toString())
     this.debug(`accepted request, balance is now: ${this._balance} (minBalance: ${this._minBalance}, maxBalance: ${this._maxBalance})`)
 
+    // If refunds are disabled, raise the minBalance automatically each time we receive money
+    if (!this.enableRefunds && this._balance.isGreaterThan(this._minBalance)) {
+      this._minBalance = this._balance
+    }
+
     /* tslint:disable-next-line:no-floating-promises */
     this.maybeSend()
   }
@@ -204,6 +212,11 @@ export class PaymentSocket extends EventEmitter {
       // TODO adjust based on exchange rate and how much peer wants
       sourceAmount = BigNumber.min(this._balance.minus(this._minBalance), this.maxPaymentSize)
       sourceAmount = forceValueToBeBetween(sourceAmount, 0, this.maxPaymentSize)
+      if (sourceAmount.isEqualTo(0)) {
+        this.debug('peer requested money but we are already at our minimum balance')
+        this.sending = false
+        return
+      }
       this.debug(`sending ${sourceAmount} because peer requested payment`)
     } else {
       // TODO should we close the socket now?
@@ -271,6 +284,11 @@ export class PaymentSocket extends EventEmitter {
   }
 }
 
+export interface ServerCreateSocketOpts {
+  id?: Buffer,
+  enableRefunds?: boolean
+}
+
 export class PaymentServer {
   protected receiver: PSK2.Receiver
   protected sockets: Map<string, PaymentSocket>
@@ -295,9 +313,13 @@ export class PaymentServer {
     this.debug('disconnected')
   }
 
-  createSocket (keyId?: Buffer): PaymentSocket {
-    const socketId = (keyId || randomBytes(18)).toString('hex')
-    if (keyId && this.sockets.has(socketId)) {
+  createSocket (opts?: ServerCreateSocketOpts): PaymentSocket {
+    if (!opts) {
+      opts = {}
+    }
+
+    const socketId = (opts.id || randomBytes(18)).toString('hex')
+    if (opts.id && this.sockets.has(socketId)) {
       this.debug(`socket already exists with id:${socketId}`)
       return this.sockets.get(socketId)!
     }
@@ -306,7 +328,8 @@ export class PaymentServer {
     const socket = new PaymentSocket({
       plugin: this.plugin,
       destinationAccount,
-      sharedSecret
+      sharedSecret,
+      enableRefunds: opts.enableRefunds
     })
     this.sockets.set(socketId, socket)
     this.debug(`created new socket with id: ${socketId}`)
@@ -339,7 +362,8 @@ export interface CreateSocketOpts {
   destinationAccount: string,
   sharedSecret: Buffer,
   minBalance?: BigNumber.Value,
-  maxBalance?: BigNumber.Value
+  maxBalance?: BigNumber.Value,
+  enableRefunds?: boolean
 }
 
 export async function createSocket (opts: CreateSocketOpts) {
@@ -365,7 +389,8 @@ export async function createSocket (opts: CreateSocketOpts) {
     sharedSecret,
     peerDestinationAccount: opts.destinationAccount,
     peerSharedSecret: opts.sharedSecret,
-    sendAddressAndSecret: true
+    sendAddressAndSecret: true,
+    enableRefunds: opts.enableRefunds
   })
   if (opts.minBalance !== undefined) {
     socket.setMinBalance(opts.minBalance)

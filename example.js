@@ -6,7 +6,9 @@ async function run () {
   const receiverPlugin = new IlpPluginBtp({ server: 'btp+ws://:receiver@localhost:7768' })
   const server = new PaymentServer(receiverPlugin, crypto.randomBytes(32))
   await server.connect()
-  const receiverSocket = server.createSocket()
+  const receiverSocket = server.createSocket({
+    enableRefunds: true
+  })
   receiverSocket.setMaxBalance(4000)
 
   const senderPlugin = new IlpPluginBtp({ server: 'btp+ws://:sender@localhost:7768' })
