@@ -8,6 +8,16 @@ import * as Long from 'long'
 
 const MAX_UINT64 = new BigNumber('18446744073709551615')
 
+export interface PaymentSocketOpts {
+  // TODO make sure this is a PluginV2
+  plugin: any,
+  destinationAccount: string,
+  sharedSecret: Buffer,
+  peerDestinationAccount?: string,
+  peerSharedSecret?: Buffer,
+  timeout?: number
+}
+
 export class PaymentSocket extends EventEmitter {
   public readonly destinationAccount: string
   public readonly sharedSecret: Buffer
@@ -27,14 +37,17 @@ export class PaymentSocket extends EventEmitter {
   protected sending: boolean
   protected socketTimeout: number
 
-  constructor (plugin: any, destinationAccount: string, sharedSecret: Buffer, peerDestinationAccount?: string, peerSharedSecret?: Buffer) {
+  constructor (opts: PaymentSocketOpts) {
     super()
     this.debug = Debug('ilp-protocol-paystream:PaymentSocket')
-    this.plugin = plugin
-    this.destinationAccount = destinationAccount
-    this.sharedSecret = sharedSecret
-    this.peerDestinationAccount = peerDestinationAccount
-    this.peerSharedSecret = peerSharedSecret
+
+    this.plugin = opts.plugin
+    this.destinationAccount = opts.destinationAccount
+    this.sharedSecret = opts.sharedSecret
+    this.peerDestinationAccount = opts.peerDestinationAccount
+    this.peerSharedSecret = opts.peerSharedSecret
+    this.socketTimeout = opts.timeout || 60000
+
     this._balance = new BigNumber(0)
     this._minBalance = new BigNumber(0)
     this._maxBalance = new BigNumber(Infinity)
@@ -46,7 +59,6 @@ export class PaymentSocket extends EventEmitter {
     this.closed = false
     this.sending = false
     // TODO make this configurable
-    this.socketTimeout = 60000
   }
 
   get balance (): string {
@@ -175,6 +187,7 @@ export class PaymentSocket extends EventEmitter {
       // Don't keep looping because we're just going to send one request for money and then wait to get paid
       shouldContinue = false
     } else if (this._balance.isGreaterThan(this._maxBalance)) {
+      // TODO don't send if the receiver doesn't want any more
       sourceAmount = BigNumber.min(this._balance.minus(this._maxBalance), this.maxPaymentSize)
       amountExpected = new BigNumber(0)
       amountWanted = this._maxBalance.minus(this._balance)
@@ -288,7 +301,11 @@ export class PaymentServer {
     }
 
     const { destinationAccount, sharedSecret } = this.receiver.generateAddressAndSecret(Buffer.from(socketId, 'hex'))
-    const socket = new PaymentSocket(this.plugin, destinationAccount, sharedSecret)
+    const socket = new PaymentSocket({
+      plugin: this.plugin,
+      destinationAccount,
+      sharedSecret
+    })
     this.sockets.set(socketId, socket)
     this.debug(`created new socket with id: ${socketId}`)
 
@@ -340,7 +357,13 @@ export async function createSocket (opts: CreateSocketOpts) {
     }
   })
   const { destinationAccount, sharedSecret } = receiver.generateAddressAndSecret(keyId)
-  socket = new PaymentSocket(opts.plugin, destinationAccount, sharedSecret, opts.destinationAccount, opts.sharedSecret)
+  socket = new PaymentSocket({
+    plugin: opts.plugin,
+    destinationAccount,
+    sharedSecret,
+    peerDestinationAccount: opts.destinationAccount,
+    peerSharedSecret: opts.sharedSecret
+  })
   if (opts.minBalance !== undefined) {
     socket.setMinBalance(opts.minBalance)
   }
