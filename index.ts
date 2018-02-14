@@ -15,7 +15,8 @@ export interface PaymentSocketOpts {
   sharedSecret: Buffer,
   peerDestinationAccount?: string,
   peerSharedSecret?: Buffer,
-  timeout?: number
+  timeout?: number,
+  sendAddressAndSecret?: boolean
 }
 
 export class PaymentSocket extends EventEmitter {
@@ -36,6 +37,7 @@ export class PaymentSocket extends EventEmitter {
   protected closed: boolean
   protected sending: boolean
   protected socketTimeout: number
+  protected sendAddressAndSecret: boolean
 
   constructor (opts: PaymentSocketOpts) {
     super()
@@ -58,7 +60,7 @@ export class PaymentSocket extends EventEmitter {
     this._totalDelivered = new BigNumber(0)
     this.closed = false
     this.sending = false
-    // TODO make this configurable
+    this.sendAddressAndSecret = !!opts.sendAddressAndSecret
   }
 
   get balance (): string {
@@ -215,17 +217,21 @@ export class PaymentSocket extends EventEmitter {
       sourceAmount = new BigNumber(0)
     }
 
+    const chunkData: PaymentChunkData = {
+      amountExpected,
+      amountWanted
+    }
+    if (this.sendAddressAndSecret) {
+      chunkData.destinationAccount = this.destinationAccount
+      chunkData.sharedSecret = this.sharedSecret
+      this.sendAddressAndSecret = false
+    }
+
     const result = await PSK2.sendRequest(this.plugin, {
       destinationAccount: this.peerDestinationAccount,
       sharedSecret: this.peerSharedSecret,
       sourceAmount: sourceAmount.toString(),
-      data: serializeChunkData({
-        amountExpected,
-        amountWanted,
-        // TODO only send the destinationAccount and sharedSecret once
-        destinationAccount: this.destinationAccount,
-        sharedSecret: this.sharedSecret
-      })
+      data: serializeChunkData(chunkData)
     })
 
     this.parseChunkData(result.data)
@@ -362,7 +368,8 @@ export async function createSocket (opts: CreateSocketOpts) {
     destinationAccount,
     sharedSecret,
     peerDestinationAccount: opts.destinationAccount,
-    peerSharedSecret: opts.sharedSecret
+    peerSharedSecret: opts.sharedSecret,
+    sendAddressAndSecret: true
   })
   if (opts.minBalance !== undefined) {
     socket.setMinBalance(opts.minBalance)
