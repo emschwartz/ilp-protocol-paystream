@@ -21,7 +21,7 @@ async function run () {
     if (senderSocket.balance === '-4000' && senderSocket.minBalance !== '0') {
       senderSocket.setMinAndMaxBalance(0)
     }
-  }, 5000)
+  })
 }
 
 run().catch(err => console.log(err))

@@ -164,41 +164,46 @@ export class PaymentSocket extends EventEmitter {
 
     this.debug(`maybeSend - balance: ${this._balance}, minBalance: ${this._minBalance}, maxBalance: ${this._maxBalance}, peerExpects: ${this.peerExpects}, peerWants: ${this.peerWants}`)
 
+    // Wait until they've told us their address or close the socket if a timeout is reached
     if (!this.peerDestinationAccount || !this.peerSharedSecret) {
       this.debug('waiting for the other side to tell us their ILP address')
-      // TODO check this if we get an incoming chunk before the timeout
-      setTimeout(() => {
-        if (!this.peerDestinationAccount) {
-          this.debug('did not get destinationAccount from other side within timeout, closing socket')
-          this.close()
+      await new Promise((resolve, reject) => {
+        setTimeout(() => resolve(), this.socketTimeout)
+
+        const chunkListener = () => {
+          if (this.peerDestinationAccount) {
+            resolve()
+            this.removeListener('chunk', chunkListener)
+          }
         }
-      }, this.socketTimeout)
-      this.sending = false
-      return
+        this.on('chunk', chunkListener)
+      })
+      if (!this.peerDestinationAccount || !this.peerSharedSecret) {
+        this.debug('did not get destinationAccount from other side within timeout, closing socket')
+        this.close()
+        return
+      }
     }
 
     // Determine if we're requesting money or pushing money
+    // (A request for money is just a 0-amount packet that updates our min/max values)
+    const amountExpected = this._minBalance.minus(this._balance)
+    const amountWanted = this._maxBalance.minus(this._balance)
     let sourceAmount
-    let amountExpected
-    let amountWanted
     if (this._balance.isLessThan(this._minBalance)) {
       sourceAmount = new BigNumber(0)
-      amountExpected = this._minBalance.minus(this._balance)
-      amountWanted = this._maxBalance.minus(this._balance)
       this.debug(`requesting ${amountExpected} from peer`)
       // Don't keep looping because we're just going to send one request for money and then wait to get paid
       shouldContinue = false
     } else if (this._balance.isGreaterThan(this._maxBalance)) {
       // TODO don't send if the receiver doesn't want any more
-      sourceAmount = BigNumber.min(this._balance.minus(this._maxBalance), this.maxPaymentSize)
-      amountExpected = new BigNumber(0)
-      amountWanted = this._maxBalance.minus(this._balance)
+      sourceAmount = this._balance.minus(this._maxBalance)
+      sourceAmount = forceValueToBeBetween(sourceAmount, 0, this.maxPaymentSize)
       this.debug(`pushing ${sourceAmount} to peer`)
     } else if (this.peerExpects.isGreaterThan(0)) {
       // TODO adjust based on exchange rate and how much peer wants
-      sourceAmount = new BigNumber(1000)
-      amountExpected = new BigNumber(0)
-      amountWanted = this._maxBalance.minus(this._balance)
+      sourceAmount = BigNumber.min(this._balance.minus(this._minBalance), this.maxPaymentSize)
+      sourceAmount = forceValueToBeBetween(sourceAmount, 0, this.maxPaymentSize)
       this.debug(`sending ${sourceAmount} because peer requested payment`)
     } else {
       // TODO should we close the socket now?
@@ -207,19 +212,9 @@ export class PaymentSocket extends EventEmitter {
       return
     }
 
-    if (sourceAmount.isGreaterThan(this.maxPaymentSize)) {
-      sourceAmount = this.maxPaymentSize
-    }
-    if (sourceAmount.isGreaterThan(MAX_UINT64)) {
-      sourceAmount = MAX_UINT64
-    }
-    if (sourceAmount.isLessThan(0)) {
-      sourceAmount = new BigNumber(0)
-    }
-
     const chunkData: PaymentChunkData = {
-      amountExpected,
-      amountWanted
+      amountExpected: forceValueToBeBetween(amountExpected, 0, MAX_UINT64),
+      amountWanted: forceValueToBeBetween(amountWanted, 0, MAX_UINT64)
     }
     if (this.sendAddressAndSecret) {
       chunkData.destinationAccount = this.destinationAccount
@@ -227,6 +222,7 @@ export class PaymentSocket extends EventEmitter {
       this.sendAddressAndSecret = false
     }
 
+    // Send the chunk
     const result = await PSK2.sendRequest(this.plugin, {
       destinationAccount: this.peerDestinationAccount,
       sharedSecret: this.peerSharedSecret,
@@ -390,6 +386,10 @@ interface PaymentChunkData {
   amountWanted: BigNumber,
   destinationAccount?: string,
   sharedSecret?: Buffer
+}
+
+function forceValueToBeBetween (value: BigNumber.Value, min: BigNumber.Value, max: BigNumber.Value): BigNumber {
+  return BigNumber.min(BigNumber.max(value, min), max)
 }
 
 function serializeChunkData (chunkData: PaymentChunkData): Buffer {
