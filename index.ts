@@ -17,7 +17,8 @@ export interface PaymentSocketOpts {
   peerSharedSecret?: Buffer,
   timeout?: number,
   sendAddressAndSecret?: boolean,
-  enableRefunds?: boolean
+  enableRefunds?: boolean,
+  identity?: string
 }
 
 export class PaymentSocket extends EventEmitter {
@@ -43,7 +44,7 @@ export class PaymentSocket extends EventEmitter {
 
   constructor (opts: PaymentSocketOpts) {
     super()
-    this.debug = Debug('ilp-protocol-paystream:PaymentSocket')
+    this.debug = Debug(`ilp-protocol-paystream:PaymentSocket${opts.identity ? ':' + opts.identity : ''}`)
 
     this.plugin = opts.plugin
     this.destinationAccount = opts.destinationAccount
@@ -64,6 +65,7 @@ export class PaymentSocket extends EventEmitter {
     this.sending = false
     this.sendAddressAndSecret = !!opts.sendAddressAndSecret
     this.enableRefunds = !!opts.enableRefunds
+    this.debug(`new socket created with minBalance ${this._minBalance}, maxBalance ${this._maxBalance}, and refunds ${this.enableRefunds ? 'enabled' :  'disabled'}`)
   }
 
   get balance (): string {
@@ -121,6 +123,7 @@ export class PaymentSocket extends EventEmitter {
     this.debug(`closing payment socket with destinationAccount: ${this.destinationAccount}`)
     this.closed = true
     this.emit('close')
+    this.removeAllListeners()
   }
 
   async handleRequest (request: PSK2.RequestHandlerParams): Promise<void> {
@@ -131,7 +134,9 @@ export class PaymentSocket extends EventEmitter {
 
     this.parseChunkData(request.data)
 
-    if (request.amount.toString() !== '0' && this._balance.isGreaterThanOrEqualTo(this._maxBalance)) {
+    const requestAmount = new BigNumber(request.amount.toString())
+
+    if (requestAmount.isGreaterThan(0) && this._balance.isGreaterThanOrEqualTo(this._maxBalance)) {
       this.debug(`rejecting request because balance is already: ${this._balance} (minBalance: ${this._minBalance}, maxBalance: ${this._maxBalance})`)
       request.reject(serializeChunkData({
         amountExpected: this._minBalance.minus(this._balance),
@@ -141,24 +146,32 @@ export class PaymentSocket extends EventEmitter {
       return
     }
 
+    // TODO should we reject requests with 0 amounts?
+
     // TODO make sure accept() call succeeds before increasing balance
-    this._balance = this._balance.plus(request.amount.toString(10))
+    this._balance = this._balance.plus(requestAmount)
+    const amountExpected = forceValueToBeBetween(this._minBalance.minus(this._balance), 0, MAX_UINT64)
+    const amountWanted = forceValueToBeBetween(this._maxBalance.minus(this._balance), 0, MAX_UINT64)
+    this.debug(`responding to peer telling them we expect: ${amountExpected} and want: ${amountWanted}`)
     request.accept(serializeChunkData({
-      amountExpected: this._minBalance.minus(this._balance),
-      amountWanted: this._maxBalance.minus(this._balance)
+      amountExpected,
+      amountWanted
       // don't include destinationAccount or sharedSecret because the other side already knows it
     }))
-    this.emit('chunk')
-    this.emit('incoming_chunk', request.amount.toString())
-    this.debug(`accepted request, balance is now: ${this._balance} (minBalance: ${this._minBalance}, maxBalance: ${this._maxBalance})`)
 
-    // If refunds are disabled, raise the minBalance automatically each time we receive money
-    if (!this.enableRefunds && this._balance.isGreaterThan(this._minBalance)) {
-      this._minBalance = this._balance
+
+    if (requestAmount.isGreaterThan(0)) {
+      this.emit('chunk')
+      this.emit('incoming_chunk', request.amount.toString())
+
+      // If refunds are disabled, raise the minBalance automatically each time we receive money
+      if (!this.enableRefunds && this._balance.isGreaterThan(this._minBalance)) {
+        this.debug(`raising min balance from ${this._minBalance} to the current balance of ${this._balance} to prevent refund`)
+        this._minBalance = this._balance
+      }
     }
 
-    /* tslint:disable-next-line:no-floating-promises */
-    this.maybeSend()
+    this.debug(`accepted request with amount ${requestAmount}, balance is now: ${this._balance} (minBalance: ${this._minBalance}, maxBalance: ${this._maxBalance})`)
   }
 
   protected async maybeSend (): Promise<void> {
@@ -176,12 +189,13 @@ export class PaymentSocket extends EventEmitter {
     if (!this.peerDestinationAccount || !this.peerSharedSecret) {
       this.debug('waiting for the other side to tell us their ILP address')
       await new Promise((resolve, reject) => {
-        setTimeout(() => resolve(), this.socketTimeout)
+        const timeout = setTimeout(() => resolve(), this.socketTimeout)
 
         const chunkListener = () => {
           if (this.peerDestinationAccount) {
             resolve()
             this.removeListener('chunk', chunkListener)
+            clearTimeout(timeout)
           }
         }
         this.on('chunk', chunkListener)
@@ -203,8 +217,7 @@ export class PaymentSocket extends EventEmitter {
       this.debug(`requesting ${amountExpected} from peer`)
       // Don't keep looping because we're just going to send one request for money and then wait to get paid
       shouldContinue = false
-    } else if (this._balance.isGreaterThan(this._maxBalance)) {
-      // TODO don't send if the receiver doesn't want any more
+    } else if (this._balance.isGreaterThan(this._maxBalance) && this.peerWants.isGreaterThan(0)) {
       sourceAmount = this._balance.minus(this._maxBalance)
       sourceAmount = forceValueToBeBetween(sourceAmount, 0, this.maxPaymentSize)
       this.debug(`pushing ${sourceAmount} to peer`)
@@ -218,6 +231,9 @@ export class PaymentSocket extends EventEmitter {
         return
       }
       this.debug(`sending ${sourceAmount} because peer requested payment`)
+    } else if (this.sendAddressAndSecret) {
+      sourceAmount = new BigNumber(0)
+      this.debug(`sending chunk of 0 just to tell the other party our address and secret`)
     } else {
       // TODO should we close the socket now?
       this.debug(`don't need to send or request money`)
@@ -229,6 +245,7 @@ export class PaymentSocket extends EventEmitter {
       amountExpected: forceValueToBeBetween(amountExpected, 0, MAX_UINT64),
       amountWanted: forceValueToBeBetween(amountWanted, 0, MAX_UINT64)
     }
+    this.debug(`telling peer we expect: ${chunkData.amountExpected} and want: ${chunkData.amountWanted}`)
     if (this.sendAddressAndSecret) {
       chunkData.destinationAccount = this.destinationAccount
       chunkData.sharedSecret = this.sharedSecret
@@ -241,6 +258,7 @@ export class PaymentSocket extends EventEmitter {
       sharedSecret: this.peerSharedSecret,
       sourceAmount: sourceAmount.toString(),
       data: serializeChunkData(chunkData)
+      // TODO set minDestinationAmount based on exchange rate
     })
 
     this.parseChunkData(result.data)
@@ -249,7 +267,7 @@ export class PaymentSocket extends EventEmitter {
       this._totalSent = this._totalSent.plus(sourceAmount)
       this._totalDelivered = this._totalDelivered.plus(result.destinationAmount.toString())
       this._balance = this._balance.minus(sourceAmount)
-      this.debug(`sent chunk, balance is now: ${this._balance} (minBalance: ${this._minBalance}, maxBalance: ${this._maxBalance})`)
+      this.debug(`sent chunk of ${sourceAmount}, balance is now: ${this._balance} (minBalance: ${this._minBalance}, maxBalance: ${this._maxBalance}, peerExpects: ${this.peerExpects}, peerWants: ${this.peerWants})`)
       this.emit('outgoing_chunk', sourceAmount.toString())
       this.emit('chunk')
 
@@ -262,6 +280,7 @@ export class PaymentSocket extends EventEmitter {
 
     this.sending = false
     if (shouldContinue) {
+      this.debug('going to try sending again')
       return this.maybeSend()
     }
   }
@@ -309,7 +328,11 @@ export class PaymentServer {
   }
 
   async disconnect (): Promise<void> {
+    this.debug('disconnecting receiver and closing all sockets')
     await this.receiver.disconnect()
+    for (let socket of this.sockets.values()) {
+      socket.close()
+    }
     this.debug('disconnected')
   }
 
@@ -329,7 +352,8 @@ export class PaymentServer {
       plugin: this.plugin,
       destinationAccount,
       sharedSecret,
-      enableRefunds: opts.enableRefunds
+      enableRefunds: opts.enableRefunds,
+      identity: 'sever'
     })
     this.sockets.set(socketId, socket)
     this.debug(`created new socket with id: ${socketId}`)
@@ -390,7 +414,8 @@ export async function createSocket (opts: CreateSocketOpts) {
     peerDestinationAccount: opts.destinationAccount,
     peerSharedSecret: opts.sharedSecret,
     sendAddressAndSecret: true,
-    enableRefunds: opts.enableRefunds
+    enableRefunds: opts.enableRefunds,
+    identity: 'client'
   })
   if (opts.minBalance !== undefined) {
     socket.setMinBalance(opts.minBalance)
@@ -418,8 +443,8 @@ function forceValueToBeBetween (value: BigNumber.Value, min: BigNumber.Value, ma
 }
 
 function serializeChunkData (chunkData: PaymentChunkData): Buffer {
-  const amountExpected = BigNumber.min(BigNumber.max(0, chunkData.amountExpected), MAX_UINT64)
-  const amountWanted = BigNumber.min(BigNumber.max(0, chunkData.amountWanted), MAX_UINT64)
+  const amountExpected = forceValueToBeBetween(chunkData.amountExpected, 0, MAX_UINT64)
+  const amountWanted = forceValueToBeBetween(chunkData.amountWanted, 0, MAX_UINT64)
 
   const writer = new oer.Writer()
   writer.writeUInt64(bigNumberToHighLow(amountExpected))
