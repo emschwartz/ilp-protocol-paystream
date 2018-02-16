@@ -15,9 +15,8 @@ export interface PaymentSocketOpts {
   destinationAccount: string,
   sharedSecret: Buffer,
   peerDestinationAccount?: string,
-  peerSharedSecret?: Buffer,
   timeout?: number,
-  sendAddressAndSecret?: boolean,
+  sendAddress?: boolean,
   enableRefunds?: boolean,
   identity?: string
 }
@@ -27,7 +26,6 @@ export class PaymentSocket extends EventEmitter {
   protected _sharedSecret: Buffer
   protected plugin: any
   protected peerDestinationAccount?: string
-  protected peerSharedSecret?: Buffer
   protected peerWants: BigNumber
   protected peerExpects: BigNumber
   protected _balance: BigNumber
@@ -40,7 +38,7 @@ export class PaymentSocket extends EventEmitter {
   protected closed: boolean
   protected sending: boolean
   protected socketTimeout: number
-  protected sendAddressAndSecret: boolean
+  protected sendAddress: boolean
   protected enableRefunds: boolean
   // TODO expose the number of chunks sent/received or fulfilled/rejected?
 
@@ -53,7 +51,6 @@ export class PaymentSocket extends EventEmitter {
     this._destinationAccount = opts.destinationAccount
     this._sharedSecret = opts.sharedSecret
     this.peerDestinationAccount = opts.peerDestinationAccount
-    this.peerSharedSecret = opts.peerSharedSecret
     this.socketTimeout = opts.timeout || 60000
 
     this._balance = new BigNumber(0)
@@ -66,11 +63,11 @@ export class PaymentSocket extends EventEmitter {
     this._totalDelivered = new BigNumber(0)
     this.closed = false
     this.sending = false
-    this.sendAddressAndSecret = !!opts.sendAddressAndSecret
+    this.sendAddress = !!opts.sendAddress
     this.enableRefunds = !!opts.enableRefunds
     this.debug(`new socket created with minBalance ${this._minBalance}, maxBalance ${this._maxBalance}, and refunds ${this.enableRefunds ? 'enabled' :  'disabled'}`)
 
-    if (this.sendAddressAndSecret) {
+    if (this.sendAddress) {
       this.maybeSend()
     }
   }
@@ -216,7 +213,7 @@ export class PaymentSocket extends EventEmitter {
     this.debug(`maybeSend - balance: ${this._balance}, minBalance: ${this._minBalance}, maxBalance: ${this._maxBalance}, peerExpects: ${this.peerExpects}, peerWants: ${this.peerWants}`)
 
     // Wait until they've told us their address or close the socket if a timeout is reached
-    if (!this.peerDestinationAccount || !this.peerSharedSecret) {
+    if (!this.peerDestinationAccount) {
       this.debug('waiting for the other side to tell us their ILP address')
       await new Promise((resolve, reject) => {
         const timeout = setTimeout(() => resolve(), this.socketTimeout)
@@ -230,7 +227,7 @@ export class PaymentSocket extends EventEmitter {
         }
         this.on('chunk', chunkListener)
       })
-      if (!this.peerDestinationAccount || !this.peerSharedSecret) {
+      if (!this.peerDestinationAccount) {
         this.debug('did not get destinationAccount from other side within timeout, closing socket')
         this.close()
         return
@@ -264,8 +261,9 @@ export class PaymentSocket extends EventEmitter {
         return
       }
       this.debug(`sending ${sourceAmount} because peer requested payment`)
-    } else if (this.sendAddressAndSecret) {
+    } else if (this.sendAddress) {
       // Send a dummy request just to tell the other side our details
+      // TODO the initialization call should just be separate from this flow
       sourceAmount = new BigNumber(0)
       this.debug(`sending chunk of 0 just to tell the other party our address and secret`)
     } else {
@@ -283,16 +281,15 @@ export class PaymentSocket extends EventEmitter {
       amountWanted: forceValueToBeBetween(amountWanted, 0, MAX_UINT64)
     }
     this.debug(`telling peer we expect: ${chunkData.amountExpected} and want: ${chunkData.amountWanted}`)
-    if (this.sendAddressAndSecret) {
+    if (this.sendAddress) {
       chunkData.destinationAccount = this._destinationAccount
-      chunkData.sharedSecret = this._sharedSecret
-      this.sendAddressAndSecret = false
+      this.sendAddress = false
     }
 
     // Send the chunk
     const result = await PSK2.sendRequest(this.plugin, {
       destinationAccount: this.peerDestinationAccount,
-      sharedSecret: this.peerSharedSecret,
+      sharedSecret: this._sharedSecret,
       sourceAmount: sourceAmount.toString(),
       data: serializeChunkData(chunkData)
       // TODO set minDestinationAmount based on exchange rate
@@ -368,7 +365,6 @@ export class PaymentSocket extends EventEmitter {
       this.peerWants = chunkData.amountWanted
       this.peerExpects = chunkData.amountExpected
       this.peerDestinationAccount = chunkData.destinationAccount || this.peerDestinationAccount
-      this.peerSharedSecret = chunkData.sharedSecret || this.peerSharedSecret
     } catch (err) {
       this.debug('unable to parse chunk data from peer:', err)
     }
@@ -475,29 +471,20 @@ export interface CreateSocketOpts {
 }
 
 export async function createSocket (opts: CreateSocketOpts) {
-  const keyId = randomBytes(18)
   const debug = Debug('ilp-protocol-paystream:createSocket')
   let socket: PaymentSocket
   const receiver = await PSK2.createReceiver({
     plugin: opts.plugin,
-    requestHandler: (request: PSK2.RequestHandlerParams) => {
-      if (Buffer.isBuffer(request.keyId) && keyId.equals(request.keyId)) {
-        return socket.handleRequest(request)
-      } else {
-        // TODO tell the other side why we're rejecting it
-        debug(`rejecting request because keyId does not match socket. actual: ${request.keyId ? request.keyId.toString('hex') : 'undefined' }, expected: ${keyId.toString('hex')}`)
-        return request.reject()
-      }
-    }
   })
-  const { destinationAccount, sharedSecret } = receiver.generateAddressAndSecret(keyId)
+  const { destinationAccount } = receiver.registerRequestHandlerForSecret(opts.sharedSecret, (request: PSK2.RequestHandlerParams) => {
+    return socket.handleRequest(request)
+  })
   socket = new PaymentSocket({
     plugin: opts.plugin,
     destinationAccount,
-    sharedSecret,
+    sharedSecret: opts.sharedSecret,
     peerDestinationAccount: opts.destinationAccount,
-    peerSharedSecret: opts.sharedSecret,
-    sendAddressAndSecret: true,
+    sendAddress: true,
     enableRefunds: opts.enableRefunds,
     identity: 'client'
   })
@@ -522,8 +509,7 @@ interface PaymentChunkData {
   // TODO do we need to send all of these numbers?
   amountExpected: BigNumber,
   amountWanted: BigNumber,
-  destinationAccount?: string,
-  sharedSecret?: Buffer
+  destinationAccount?: string
 }
 
 function forceValueToBeBetween (value: BigNumber.Value, min: BigNumber.Value, max: BigNumber.Value): BigNumber {
@@ -538,7 +524,6 @@ function serializeChunkData (chunkData: PaymentChunkData): Buffer {
   writer.writeUInt64(bigNumberToHighLow(amountExpected))
   writer.writeUInt64(bigNumberToHighLow(amountWanted))
   writer.writeVarOctetString(Buffer.from(chunkData.destinationAccount || '', 'utf8'))
-  writer.writeVarOctetString(chunkData.sharedSecret || Buffer.alloc(0))
   return writer.getBuffer()
 }
 
@@ -550,16 +535,11 @@ function deserializeChunkData (buffer: Buffer): PaymentChunkData {
   if (destinationAccount === '') {
     destinationAccount = undefined
   }
-  let sharedSecret: Buffer | undefined = reader.readVarOctetString()
-  if (sharedSecret.length === 0) {
-    sharedSecret = undefined
-  }
 
   return {
     amountExpected,
     amountWanted,
-    destinationAccount,
-    sharedSecret
+    destinationAccount
   }
 }
 

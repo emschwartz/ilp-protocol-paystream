@@ -255,3 +255,23 @@ describe('PaymentServer', function () {
 
   })
 })
+
+describe('Client Socket (createSocket)', function () {
+  beforeEach(async function () {
+    this.pluginA = new MockPlugin(0.5)
+    this.pluginB = this.pluginA.mirror
+    this.server = await createServer({ plugin: this.pluginB })
+  })
+
+  it('should use the same sharedSecret as the server', async function () {
+    const { destinationAccount, sharedSecret } = this.server.createSocket()
+
+    const clientSocket = await createSocket({
+      plugin: this.pluginA,
+      destinationAccount,
+      sharedSecret
+    })
+
+    assert.deepEqual(sharedSecret, clientSocket.sharedSecret)
+  })
+})
