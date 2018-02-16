@@ -7,6 +7,7 @@ import * as oer from 'oer-utils'
 import * as Long from 'long'
 
 const MAX_UINT64 = new BigNumber('18446744073709551615')
+const DEFAULT_STABILIZED_TIMEOUT = 60000
 
 export interface PaymentSocketOpts {
   // TODO make sure this is a PluginV2
@@ -22,8 +23,8 @@ export interface PaymentSocketOpts {
 }
 
 export class PaymentSocket extends EventEmitter {
-  public readonly destinationAccount: string
-  public readonly sharedSecret: Buffer
+  protected _destinationAccount: string
+  protected _sharedSecret: Buffer
   protected plugin: any
   protected peerDestinationAccount?: string
   protected peerSharedSecret?: Buffer
@@ -41,14 +42,16 @@ export class PaymentSocket extends EventEmitter {
   protected socketTimeout: number
   protected sendAddressAndSecret: boolean
   protected enableRefunds: boolean
+  // TODO expose the number of chunks sent/received or fulfilled/rejected?
 
   constructor (opts: PaymentSocketOpts) {
     super()
+    // TODO maybe these statements should have an ID that matches the destinationAccount and keyId seen in the logs from other modules
     this.debug = Debug(`ilp-protocol-paystream:PaymentSocket${opts.identity ? ':' + opts.identity : ''}`)
 
     this.plugin = opts.plugin
-    this.destinationAccount = opts.destinationAccount
-    this.sharedSecret = opts.sharedSecret
+    this._destinationAccount = opts.destinationAccount
+    this._sharedSecret = opts.sharedSecret
     this.peerDestinationAccount = opts.peerDestinationAccount
     this.peerSharedSecret = opts.peerSharedSecret
     this.socketTimeout = opts.timeout || 60000
@@ -66,6 +69,18 @@ export class PaymentSocket extends EventEmitter {
     this.sendAddressAndSecret = !!opts.sendAddressAndSecret
     this.enableRefunds = !!opts.enableRefunds
     this.debug(`new socket created with minBalance ${this._minBalance}, maxBalance ${this._maxBalance}, and refunds ${this.enableRefunds ? 'enabled' :  'disabled'}`)
+
+    if (this.sendAddressAndSecret) {
+      this.maybeSend()
+    }
+  }
+
+  get destinationAccount (): string {
+    return this._destinationAccount
+  }
+
+  get sharedSecret (): Buffer {
+    return this._sharedSecret
   }
 
   get balance (): string {
@@ -120,10 +135,9 @@ export class PaymentSocket extends EventEmitter {
   }
 
   close () {
-    this.debug(`closing payment socket with destinationAccount: ${this.destinationAccount}`)
+    this.debug(`closing payment socket with destinationAccount: ${this._destinationAccount}`)
     this.closed = true
     this.emit('close')
-    this.removeAllListeners()
   }
 
   async handleRequest (request: PSK2.RequestHandlerParams): Promise<void> {
@@ -171,14 +185,30 @@ export class PaymentSocket extends EventEmitter {
       }
     }
 
-    this.debug(`accepted request with amount ${requestAmount}, balance is now: ${this._balance} (minBalance: ${this._minBalance}, maxBalance: ${this._maxBalance})`)
+    this.debug(`accepted request with amount ${requestAmount}, balance is now: ${this._balance} (minBalance: ${this._minBalance}, maxBalance: ${this._maxBalance}, peerExpects: ${this.peerExpects}, peerWants: ${this.peerWants})`)
+
+    if (this.peerExpects.isGreaterThan(0) && this._balance.isGreaterThan(this._minBalance)) {
+      return this.maybeSend()
+    }
+
+    // Check if the socket has stabilized (both sides are satisfied)
+    if (this.isStabilized()) {
+      this.debug('socket stabilized')
+      this.emit('stabilized')
+    }
   }
 
   protected async maybeSend (): Promise<void> {
+    // Start on the next tick of the event loop
+    // This ensures that if someone calls "await socket.stabilized" right after changing the limit
+    // the "stabilized" event will fire _after_ the listener has been added
+    await Promise.resolve()
+
     let shouldContinue = true
 
     // Make sure we don't have two loops sending at the same time
     if (this.sending) {
+      this.debug('already in the process of sending, not starting another send loop')
       return
     }
     this.sending = true
@@ -213,15 +243,18 @@ export class PaymentSocket extends EventEmitter {
     const amountWanted = this._maxBalance.minus(this._balance)
     let sourceAmount
     if (this._balance.isLessThan(this._minBalance)) {
+      // Request payment
       sourceAmount = new BigNumber(0)
       this.debug(`requesting ${amountExpected} from peer`)
       // Don't keep looping because we're just going to send one request for money and then wait to get paid
       shouldContinue = false
     } else if (this._balance.isGreaterThan(this._maxBalance) && this.peerWants.isGreaterThan(0)) {
+      // Send payment (because our balance is too high)
       sourceAmount = this._balance.minus(this._maxBalance)
       sourceAmount = forceValueToBeBetween(sourceAmount, 0, this.maxPaymentSize)
       this.debug(`pushing ${sourceAmount} to peer`)
     } else if (this.peerExpects.isGreaterThan(0)) {
+      // Peer is requesting payment, so pay until we've reached our minBalance
       // TODO adjust based on exchange rate and how much peer wants
       sourceAmount = BigNumber.min(this._balance.minus(this._minBalance), this.maxPaymentSize)
       sourceAmount = forceValueToBeBetween(sourceAmount, 0, this.maxPaymentSize)
@@ -232,12 +265,16 @@ export class PaymentSocket extends EventEmitter {
       }
       this.debug(`sending ${sourceAmount} because peer requested payment`)
     } else if (this.sendAddressAndSecret) {
+      // Send a dummy request just to tell the other side our details
       sourceAmount = new BigNumber(0)
       this.debug(`sending chunk of 0 just to tell the other party our address and secret`)
     } else {
+      // Both sides are satisfied (for now)
       // TODO should we close the socket now?
       this.debug(`don't need to send or request money`)
       this.sending = false
+      this.emit('stabilized')
+      this.debug('socket stabilized')
       return
     }
 
@@ -247,8 +284,8 @@ export class PaymentSocket extends EventEmitter {
     }
     this.debug(`telling peer we expect: ${chunkData.amountExpected} and want: ${chunkData.amountWanted}`)
     if (this.sendAddressAndSecret) {
-      chunkData.destinationAccount = this.destinationAccount
-      chunkData.sharedSecret = this.sharedSecret
+      chunkData.destinationAccount = this._destinationAccount
+      chunkData.sharedSecret = this._sharedSecret
       this.sendAddressAndSecret = false
     }
 
@@ -282,7 +319,42 @@ export class PaymentSocket extends EventEmitter {
     if (shouldContinue) {
       this.debug('going to try sending again')
       return this.maybeSend()
+    } else if (this.isStabilized()) {
+      this.emit('stabilized')
+      this.debug('socket stabilized')
+    } else {
+      this.debug('socket is not yet stabilized, but not continuing to send')
     }
+  }
+
+  async stabilized (timeout?: number): Promise<void> {
+    if (timeout === undefined) {
+      timeout = DEFAULT_STABILIZED_TIMEOUT
+    }
+
+    if (this.isStabilized()) {
+      return Promise.resolve()
+    }
+
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('Timed out without stabilizing')), timeout)
+
+      this.once('stabilized', () => {
+        if (!this.isStabilized()) {
+          reject(new Error(`Stopped outside of the balance window. Current balance is: ${this._balance}, minBalance: ${this._minBalance}, maxBalance: ${this._maxBalance}`))
+        } else {
+          clearTimeout(timer)
+          resolve()
+        }
+      })
+    }) as Promise<void>
+  }
+
+  isStabilized (): boolean {
+    return !this.sending
+      && this._balance.isLessThanOrEqualTo(this._maxBalance)
+      && this._balance.isGreaterThanOrEqualTo(this._minBalance)
+      && (this.peerExpects.isEqualTo(0) || this._balance.isEqualTo(this._minBalance))
   }
 
   protected parseChunkData (data: Buffer): void {
@@ -304,8 +376,12 @@ export class PaymentSocket extends EventEmitter {
 }
 
 export interface ServerCreateSocketOpts {
-  id?: Buffer,
   enableRefunds?: boolean
+}
+
+export interface PaymentServerOpts {
+  plugin: any,
+  secret?: Buffer
 }
 
 export class PaymentServer {
@@ -314,10 +390,11 @@ export class PaymentServer {
   protected debug: Debug.IDebugger
   protected plugin: any
 
-  constructor (plugin: any, secret: Buffer) {
+  constructor (opts: PaymentServerOpts) {
     this.debug = Debug('ilp-protocol-paystream:PaymentServer')
-    this.plugin = plugin
-    this.receiver = new PSK2.Receiver(plugin, secret)
+    this.plugin = opts.plugin
+    const secret = opts.secret || randomBytes(32)
+    this.receiver = new PSK2.Receiver(this.plugin, secret)
     this.receiver.registerRequestHandler(this.handleRequest.bind(this))
     this.sockets = new Map()
   }
@@ -341,13 +418,8 @@ export class PaymentServer {
       opts = {}
     }
 
-    const socketId = (opts.id || randomBytes(18)).toString('hex')
-    if (opts.id && this.sockets.has(socketId)) {
-      this.debug(`socket already exists with id:${socketId}`)
-      return this.sockets.get(socketId)!
-    }
-
-    const { destinationAccount, sharedSecret } = this.receiver.generateAddressAndSecret(Buffer.from(socketId, 'hex'))
+    const socketId = randomBytes(18)
+    const { destinationAccount, sharedSecret } = this.receiver.generateAddressAndSecret(socketId)
     const socket = new PaymentSocket({
       plugin: this.plugin,
       destinationAccount,
@@ -355,10 +427,10 @@ export class PaymentServer {
       enableRefunds: opts.enableRefunds,
       identity: 'sever'
     })
-    this.sockets.set(socketId, socket)
-    this.debug(`created new socket with id: ${socketId}`)
+    this.sockets.set(socketId.toString('hex'), socket)
+    this.debug(`created new socket with id: ${socketId.toString('hex')}`)
 
-    socket.once('close', () => { this.sockets.delete(socketId) })
+    socket.once('close', () => { this.sockets.delete(socketId.toString('hex')) })
 
     return socket
   }
@@ -366,19 +438,31 @@ export class PaymentServer {
   async handleRequest (request: PSK2.RequestHandlerParams): Promise<void> {
     if (!request.keyId) {
       this.debug('rejecting request because it does not have a keyId so it was not created by a PaymentServer')
-      // TODO send a better error message so the sender knows what to do
-      return request.reject()
+      // TODO send a better error message so the sender knows exactly what's going on
+      return request.reject(serializeChunkData({
+        amountWanted: new BigNumber(0),
+        amountExpected: new BigNumber(0)
+      }))
     }
 
     const socket = this.sockets.get(request.keyId.toString('hex'))
     if (!socket) {
       this.debug(`rejecting request for keyId: ${request.keyId.toString('hex')} because there is no open socket with that ID`)
-      // TODO send a better error message so the sender knows what to do
-      return request.reject()
+      // TODO send a better error message so the sender knows exactly what's going on
+      return request.reject(serializeChunkData({
+        amountWanted: new BigNumber(0),
+        amountExpected: new BigNumber(0)
+      }))
     }
 
     return socket.handleRequest(request)
   }
+}
+
+export async function createServer (opts: PaymentServerOpts): Promise<PaymentServer> {
+  const server = new PaymentServer(opts)
+  await server.connect()
+  return server
 }
 
 export interface CreateSocketOpts {
@@ -399,11 +483,11 @@ export async function createSocket (opts: CreateSocketOpts) {
     requestHandler: (request: PSK2.RequestHandlerParams) => {
       if (Buffer.isBuffer(request.keyId) && keyId.equals(request.keyId)) {
         return socket.handleRequest(request)
+      } else {
+        // TODO tell the other side why we're rejecting it
+        debug(`rejecting request because keyId does not match socket. actual: ${request.keyId ? request.keyId.toString('hex') : 'undefined' }, expected: ${keyId.toString('hex')}`)
+        return request.reject()
       }
-
-      // TODO tell the other side why we're rejecting it
-      debug(`rejecting request because keyId does not match socket. actual: ${request.keyId ? request.keyId.toString('hex') : 'undefined' }, expected: ${keyId.toString('hex')}`)
-      return request.reject()
     }
   })
   const { destinationAccount, sharedSecret } = receiver.generateAddressAndSecret(keyId)
@@ -419,9 +503,13 @@ export async function createSocket (opts: CreateSocketOpts) {
   })
   if (opts.minBalance !== undefined) {
     socket.setMinBalance(opts.minBalance)
+  } else {
+    debug(`using default minBalance of ${socket.minBalance}`)
   }
   if (opts.maxBalance !== undefined) {
     socket.setMaxBalance(opts.maxBalance)
+  } else {
+    debug(`using default maxBalance of ${socket.maxBalance}`)
   }
 
   /* tslint:disable-next-line:no-floating-promises */

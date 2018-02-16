@@ -26,7 +26,7 @@ export default class MockPlugin extends EventEmitter {
     this.dataHandler = this.defaultDataHandler
     this.moneyHandler = this.defaultMoneyHandler
     this.exchangeRate = exchangeRate
-    this.mirror = mirror || new MockPlugin(exchangeRate, this)
+    this.mirror = mirror || new MockPlugin(1 / exchangeRate, this)
     this.identity = (mirror ? 'peerB' : 'peerA')
   }
 

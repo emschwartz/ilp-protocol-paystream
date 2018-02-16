@@ -1,6 +1,6 @@
 import 'mocha'
 import { assert } from 'chai'
-import { PaymentServer, createSocket, PaymentSocket } from '..'
+import { createSocket, createServer, PaymentServer, PaymentSocket } from '../src/index'
 import MockPlugin from './mocks/plugin'
 import * as sinon from 'sinon'
 
@@ -9,101 +9,249 @@ describe('PaymentSocket', function () {
     this.pluginA = new MockPlugin(0.5)
     this.pluginB = this.pluginA.mirror
 
-    this.server = new PaymentServer(this.pluginB, Buffer.alloc(32, '00', 'hex'))
-    await this.server.connect()
-    this.serverSocket = this.server.createSocket({
-      enableRefunds: true
+    this.server = await createServer({
+      plugin: this.pluginB,
+      secret: Buffer.alloc(32)
     })
+    this.serverSocket = this.server.createSocket()
 
     this.clientSocket = await createSocket({
       plugin: this.pluginA,
       destinationAccount: this.serverSocket.destinationAccount,
-      sharedSecret: this.serverSocket.sharedSecret,
-      enableRefunds: true
+      sharedSecret: this.serverSocket.sharedSecret
     })
   })
 
-  afterEach(async function () {
-    await this.server.disconnect()
-    this.clientSocket.close()
+  describe('Exported properties', function () {
+    it('should export the destinationAccount and sharedSecret as readonly', function () {
+      assert.typeOf(this.clientSocket.destinationAccount, 'string')
+      assert(Buffer.isBuffer(this.clientSocket.sharedSecret))
+      assert.throws(() => this.clientSocket.destinationAccount = 'blah')
+      assert.throws(() => this.clientSocket.sharedSecret = Buffer.alloc(0))
+    })
+
+    it('should export the balance as a string but not allow it to be modified', function () {
+      assert.typeOf(this.clientSocket.balance, 'string')
+      assert.throws(() => this.clientSocket.balance = '10')
+    })
+
+    it('should export the minBalance as a string but not allow it to be modified', function () {
+      assert.typeOf(this.clientSocket.minBalance, 'string')
+      assert.throws(() => this.clientSocket.minBalance = '10')
+    })
+
+    it('should export the maxBalance as a string but not allow it to be modified', function () {
+      assert.typeOf(this.clientSocket.maxBalance, 'string')
+      assert.throws(() => this.clientSocket.maxBalance = '10')
+    })
+
+    it('should export the totalSent as a string but not allow it to be modified', function () {
+      assert.typeOf(this.clientSocket.totalSent, 'string')
+      assert.throws(() => this.clientSocket.totalSent = '10')
+    })
+
+    it('should export the totalDelivered as a string but not allow it to be modified', function () {
+      assert.typeOf(this.clientSocket.totalDelivered, 'string')
+      assert.throws(() => this.clientSocket.totalDelivered = '10')
+    })
   })
 
+  describe('close', function () {
+    it('should disconnect the PSK2 receiver if it is a client socket', function () {
+      const spy = sinon.spy(this.pluginA, 'disconnect')
+      this.clientSocket.close()
+      assert(spy.called)
+    })
+
+    it('should not disconnect the receiver if it is a server socket', async function () {
+      const spy = sinon.spy(this.pluginB, 'disconnect')
+      this.serverSocket.close()
+      assert(spy.notCalled)
+    })
+
+    it('should reject packets if a server socket is closed', async function () {
+      const clock = sinon.useFakeTimers()
+      this.serverSocket.close()
+      this.clientSocket.setMinAndMaxBalance(-1000)
+      const notStabilized = this.clientSocket.stabilized()
+      clock.tick(100000)
+      let errored = false
+      try {
+        await notStabilized
+      } catch (err) {
+        errored = true
+      }
+      assert(errored)
+      clock.restore()
+    })
+  })
+
+  describe('setMaxBalance', function () {
+    it('should throw an error if it is less than the minBalance', async function () {
+      assert.throws(() => this.clientSocket.setMaxBalance(-1000))
+    })
+
+    it('should not do anything if the new value is higher than the current balance', async function () {
+      this.clientSocket.setMaxBalance(1000)
+      await this.clientSocket.stabilized()
+      assert.equal(this.clientSocket.balance, '0')
+    })
+  })
+
+  describe('setMinBalance', function () {
+    it('should throw an error if it is greater than the maxBalance', async function () {
+      this.clientSocket.setMaxBalance(1000)
+      assert.throws(() => this.clientSocket.setMinBalance(2000))
+    })
+
+    it('should not do anything if the new value is lower than the current balance', async function () {
+      this.clientSocket.setMinBalance(-1000)
+      await this.clientSocket.stabilized()
+      assert.equal(this.clientSocket.balance, '0')
+    })
+  })
+
+
   describe('Events', function () {
-    it('should emit "chunk" on every incoming or outgoing request', function (done) {
+    it('should emit "chunk" on every incoming or outgoing request', async function () {
       const clientSpy = sinon.spy()
       const serverSpy = sinon.spy()
-      this.clientSocket.on('chunk', () => {
-        clientSpy()
-        if (serverSpy.callCount === 2 && clientSpy.callCount === 2) {
-          done()
-        }
-      })
+      this.clientSocket.on('chunk', clientSpy)
       this.serverSocket.on('chunk', serverSpy)
 
       this.clientSocket.setMinAndMaxBalance(-2000)
+      await this.clientSocket.stabilized()
+
+      assert.equal(clientSpy.callCount, 2)
+      assert.equal(serverSpy.callCount, 2)
     })
   })
 
   describe('Pushing money', function () {
-    it('should send until the maximum balance is reached', function (done) {
+    it('should send until the maximum balance is reached', async function () {
       this.clientSocket.setMinAndMaxBalance(-2000)
+      await this.clientSocket.stabilized()
 
-      this.serverSocket.on('chunk', () => {
-        if (this.serverSocket.balance === '1000') {
-          done()
-        }
-      })
+      assert.equal(this.serverSocket.balance, '1000')
     })
 
-    it('should allow you to send more by lowering the max balance further', function (done) {
+    it('should allow you to send more by lowering the max balance further', async function () {
       this.clientSocket.setMinAndMaxBalance(-1000)
+      await this.clientSocket.stabilized()
 
-      this.clientSocket.on('chunk', () => {
-        if (this.clientSocket.balance === '-1000') {
-          this.clientSocket.setMinAndMaxBalance(-3000)
-        }
-        if (this.serverSocket.balance === '1500') {
-          done()
-        }
-      })
+      this.clientSocket.setMinAndMaxBalance(-3000)
+      await this.clientSocket.stabilized()
+
+      assert.equal(this.serverSocket.balance, '1500')
     })
 
-    it.skip('should not go above the maxBalance of the other side', function (done) {
-      this.clientSocket.setMinAndMaxBalance(-2000)
-      this.serverSocket.setMaxBalance(1750)
+    it.skip('should not go above the maxBalance of the other side')
 
-      this.serverSocket.on('chunk', () => {
-        if (this.serverSocket.balance === '1750') {
-          done()
-        }
-      })
-    })
+    it.skip('should not try forever if it encounters an error')
   })
 
   describe('Pulling money', function () {
-    it('should request money until the minimum balance is reached', function (done) {
+    it('should request money until the minimum balance is reached', async function () {
       this.clientSocket.setMinAndMaxBalance(2000)
       this.serverSocket.setMinBalance(-4000)
 
-      this.clientSocket.on('chunk', () => {
-        if (this.clientSocket.balance === '2000') {
-          done()
-        }
-      })
+      await this.clientSocket.stabilized()
+
+      assert.equal(this.clientSocket.balance, '2000')
     })
 
-    it('should allow you to request more money by lowering the minimum balance further', function (done) {
-      this.serverSocket.setMinAndMaxBalance(1000)
+    it('should allow you to request more money by lowering the minimum balance further', async function () {
       this.clientSocket.setMinBalance(-4000)
+      this.serverSocket.setMinAndMaxBalance(1000)
+      await this.clientSocket.stabilized()
 
-      this.clientSocket.on('chunk', () => {
-        if (this.serverSocket.balance === '1000' && this.serverSocket.minBalance === '1000') {
-          this.serverSocket.setMinAndMaxBalance(2000)
-        }
-        if (this.clientSocket.balance === '-2000') {
-          done()
-        }
-      })
+      this.serverSocket.setMinAndMaxBalance(2000)
+      await this.clientSocket.stabilized()
+
+      assert.equal(this.serverSocket.balance, '2000')
     })
+
+    it.skip('should not be able to pull more money than the other party\'s minBalance')
+  })
+
+  describe('Refunds', function () {
+    it('should be disabled by default', async function () {
+      const clock = sinon.useFakeTimers()
+
+      this.clientSocket.setMinAndMaxBalance(-1000)
+      await this.clientSocket.stabilized()
+      this.clientSocket.setMinAndMaxBalance(0)
+
+      const notStabilized = this.clientSocket.stabilized()
+      clock.tick(100000)
+      let errored = false
+      try {
+        await notStabilized
+      } catch (err) {
+        errored = true
+      }
+      assert(errored)
+      assert.equal(this.serverSocket.balance, '500')
+      clock.restore()
+    })
+
+    it('should allow the payer to request their money back if enabled', async function () {
+      this.clientSocket.close()
+      const clientSocket = createSocket({
+        plugin: this.pluginA,
+        destinationAccount: this.serverSocket.destinationAccount,
+        sharedSecret: this.serverSocket.sharedSecret,
+        enableRefunds: true
+      })
+
+      // Server is paying client
+      this.serverSocket.setMinAndMaxBalance(-1000)
+      await this.serverSocket.stabilized()
+
+      this.serverSocket.setMinAndMaxBalance(0)
+      await this.serverSocket.stabilized()
+
+      assert.equal(this.serverSocket.balance, '0')
+    })
+  })
+})
+
+describe('PaymentServer', function () {
+  beforeEach(async function () {
+    this.pluginA = new MockPlugin(0.5)
+    this.pluginB = this.pluginA.mirror
+    this.server = new PaymentServer({ plugin: this.pluginB })
+  })
+
+  describe('connect', function () {
+    it('should connect the plugin', async function () {
+      const spy = sinon.spy(this.pluginB, 'connect')
+      await this.server.connect()
+      assert(spy.called)
+    })
+  })
+
+  describe('disconnect', function () {
+    beforeEach(async function () {
+      await this.server.connect()
+    })
+
+    it('should disconnect the receiver and plugin', async function () {
+      const spy = sinon.spy(this.pluginB, 'disconnect')
+      await this.server.disconnect()
+      assert(spy.called)
+    })
+
+    it('should disconnect all of the sockets', async function () {
+      const closeSpy = sinon.spy()
+      const socket1 = this.server.createSocket()
+      const socket2 = this.server.createSocket()
+      socket1.on('close', closeSpy)
+      socket2.on('close', closeSpy)
+
+      await this.server.disconnect()
+      assert.equal(closeSpy.callCount, 2)
+    })
+
   })
 })
