@@ -145,7 +145,16 @@ describe('PaymentSocket', function () {
       assert.equal(this.serverSocket.balance, '1500')
     })
 
-    it.skip('should not go above the maxBalance of the other side')
+    it('should not go above the maxBalance of the other side', async function () {
+      this.clientSocket.setMinAndMaxBalance(-2000)
+      this.serverSocket.setMaxBalance(750)
+      try {
+        await this.clientSocket.stabilized()
+      } catch (err) {
+      }
+
+      assert.equal(this.serverSocket.balance, '750')
+    })
 
     it.skip('should not try forever if it encounters an error')
   })
@@ -153,7 +162,7 @@ describe('PaymentSocket', function () {
   describe('Pulling money', function () {
     it('should request money until the minimum balance is reached', async function () {
       this.clientSocket.setMinAndMaxBalance(2000)
-      this.serverSocket.setMinBalance(-4000)
+      this.serverSocket.setMinBalance(-5000)
 
       await this.clientSocket.stabilized()
 
@@ -171,7 +180,45 @@ describe('PaymentSocket', function () {
       assert.equal(this.serverSocket.balance, '2000')
     })
 
-    it.skip('should not be able to pull more money than the other party\'s minBalance')
+    it('should end up with exactly the right amount that it requests', async function () {
+      this.clientSocket.setMinBalance(-4000)
+      this.serverSocket.setMinAndMaxBalance(1750)
+
+      await this.serverSocket.stabilized()
+
+      assert.equal(this.serverSocket.balance, '1750')
+    })
+
+    it('should emit an "error" and reject the stabilized Promise if the other party is unwilling to pay as much as one side requests', async function () {
+      const spy = sinon.spy()
+      this.serverSocket.on('error', spy)
+      this.serverSocket.setMinAndMaxBalance(2000)
+      this.clientSocket.setMinBalance(-500)
+
+      let errored = false
+      try {
+        await this.serverSocket.stabilized()
+      } catch (err) {
+        errored = true
+      }
+
+      assert(errored)
+      assert(spy.called)
+    })
+
+    it.skip('should stop sending as soon as it realizes the amount requested is too high')
+
+    it('should not be able to pull more money than the other party\'s minBalance', async function () {
+      this.serverSocket.setMinAndMaxBalance(2000)
+      this.clientSocket.setMinBalance(-500)
+
+      try {
+        await this.serverSocket.stabilized()
+      } catch (err) {
+      }
+
+      assert.equal(this.clientSocket.balance, '-500')
+    })
   })
 
   describe('Refunds', function () {

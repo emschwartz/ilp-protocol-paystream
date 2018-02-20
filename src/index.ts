@@ -162,6 +162,12 @@ export class PaymentSocket extends EventEmitter {
       }))
     }
 
+    if (request.amount.eq(0) && this._balance.isLessThan(this._minBalance)) {
+      this.debug(`requested money from other party but they aren't sending it. current balance: ${this._balance}, minBalance: ${this._minBalance}`)
+      // TODO is this always an error? What if we changed the limit between now and when the other side sent this request?
+      this.emit('error', new Error(`Requested money from other party but they aren't sending it. Current balance: ${this._balance}, expected: ${this._minBalance}`))
+    }
+
     if (requestAmount.isGreaterThan(0) && this._balance.isGreaterThanOrEqualTo(this._maxBalance)) {
       this.debug(`rejecting request because balance is already: ${this._balance} (minBalance: ${this._minBalance}, maxBalance: ${this._maxBalance})`)
       return request.reject(serializeChunkData({
@@ -264,16 +270,28 @@ export class PaymentSocket extends EventEmitter {
       // Send payment (because our balance is too high)
       sourceAmount = this._balance.minus(this._maxBalance)
       sourceAmount = forceValueToBeBetween(sourceAmount, 0, this.maxPaymentSize)
+
+      // Adjust how much we're sending to the receiver's maximum
+      if (this._exchangeRate) {
+        const sourceAmountReceiverWants = this.peerWants.dividedBy(this._exchangeRate).decimalPlaces(0, BigNumber.ROUND_CEIL)
+        sourceAmount = BigNumber.min(sourceAmount, sourceAmountReceiverWants)
+      }
       this.debug(`pushing ${sourceAmount} to peer`)
     } else if (this.peerExpects.isGreaterThan(0)) {
       // Peer is requesting payment, so pay until we've reached our minBalance
       // TODO adjust based on exchange rate and how much peer wants
       sourceAmount = BigNumber.min(this._balance.minus(this._minBalance), this.maxPaymentSize)
       sourceAmount = forceValueToBeBetween(sourceAmount, 0, this.maxPaymentSize)
+
+      // Adjust how much we're sendign to the receiver's minimum
+      if (this._exchangeRate) {
+        const sourceAmountReceiverExpects = this.peerExpects.dividedBy(this._exchangeRate).decimalPlaces(0, BigNumber.ROUND_CEIL)
+        sourceAmount = BigNumber.min(sourceAmount, sourceAmountReceiverExpects)
+      }
+
       if (sourceAmount.isEqualTo(0)) {
         this.debug('peer requested money but we are already at our minimum balance')
-        this.sending = false
-        return
+        shouldContinue = false
       }
       this.debug(`sending ${sourceAmount} because peer requested payment`)
     } else if (this.sendAddress) {
@@ -302,7 +320,7 @@ export class PaymentSocket extends EventEmitter {
       this.sendAddress = false
     }
 
-    // Use the exchange rate to set the minDestinationAmount the receiver will accept
+    // Use the exchange rate to determine the minDestinationAmount the receiver should accept for this chunk
     let minDestinationAmount
     if (this._exchangeRate) {
       minDestinationAmount = sourceAmount
