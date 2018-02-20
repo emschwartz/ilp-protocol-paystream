@@ -8,6 +8,7 @@ import * as Long from 'long'
 
 const MAX_UINT64 = new BigNumber('18446744073709551615')
 const DEFAULT_STABILIZED_TIMEOUT = 60000
+const PROBE_AMOUNT = 1000
 
 export interface PaymentSocketOpts {
   // TODO make sure this is a PluginV2
@@ -18,7 +19,8 @@ export interface PaymentSocketOpts {
   timeout?: number,
   sendAddress?: boolean,
   enableRefunds?: boolean,
-  identity?: string
+  identity?: string,
+  slippage?: BigNumber
 }
 
 export class PaymentSocket extends EventEmitter {
@@ -34,12 +36,14 @@ export class PaymentSocket extends EventEmitter {
   protected maxPaymentSize: BigNumber
   protected _totalSent: BigNumber
   protected _totalDelivered: BigNumber
+  protected _exchangeRate: BigNumber
   protected debug: Debug.IDebugger
   protected closed: boolean
   protected sending: boolean
   protected socketTimeout: number
   protected sendAddress: boolean
   protected enableRefunds: boolean
+  protected slippage: BigNumber
   // TODO expose the number of chunks sent/received or fulfilled/rejected?
 
   constructor (opts: PaymentSocketOpts) {
@@ -66,6 +70,7 @@ export class PaymentSocket extends EventEmitter {
     this.sendAddress = !!opts.sendAddress
     this.enableRefunds = !!opts.enableRefunds
     this.debug(`new socket created with minBalance ${this._minBalance}, maxBalance ${this._maxBalance}, and refunds ${this.enableRefunds ? 'enabled' :  'disabled'}`)
+    this.slippage = opts.slippage || new BigNumber(0.01)
 
     if (this.sendAddress) {
       this.maybeSend()
@@ -147,14 +152,23 @@ export class PaymentSocket extends EventEmitter {
 
     const requestAmount = new BigNumber(request.amount.toString())
 
-    if (requestAmount.isGreaterThan(0) && this._balance.isGreaterThanOrEqualTo(this._maxBalance)) {
-      this.debug(`rejecting request because balance is already: ${this._balance} (minBalance: ${this._minBalance}, maxBalance: ${this._maxBalance})`)
-      request.reject(serializeChunkData({
+    if (!request.isFulfillable) {
+      // TODO disconnect if we get too many of these
+      this.debug(`got unfulfillable request`)
+      return request.reject(serializeChunkData({
         amountExpected: this._minBalance.minus(this._balance),
         amountWanted: this._maxBalance.minus(this._balance)
         // don't include destinationAccount or sharedSecret because the other side already knows it
       }))
-      return
+    }
+
+    if (requestAmount.isGreaterThan(0) && this._balance.isGreaterThanOrEqualTo(this._maxBalance)) {
+      this.debug(`rejecting request because balance is already: ${this._balance} (minBalance: ${this._minBalance}, maxBalance: ${this._maxBalance})`)
+      return request.reject(serializeChunkData({
+        amountExpected: this._minBalance.minus(this._balance),
+        amountWanted: this._maxBalance.minus(this._balance)
+        // don't include destinationAccount or sharedSecret because the other side already knows it
+      }))
     }
 
     // TODO should we reject requests with 0 amounts?
@@ -238,6 +252,7 @@ export class PaymentSocket extends EventEmitter {
     // (A request for money is just a 0-amount packet that updates our min/max values)
     const amountExpected = this._minBalance.minus(this._balance)
     const amountWanted = this._maxBalance.minus(this._balance)
+    let unfulfillableCondition: Buffer | undefined = undefined
     let sourceAmount
     if (this._balance.isLessThan(this._minBalance)) {
       // Request payment
@@ -264,8 +279,9 @@ export class PaymentSocket extends EventEmitter {
     } else if (this.sendAddress) {
       // Send a dummy request just to tell the other side our details
       // TODO the initialization call should just be separate from this flow
-      sourceAmount = new BigNumber(0)
-      this.debug(`sending chunk of 0 just to tell the other party our address and secret`)
+      sourceAmount = new BigNumber(PROBE_AMOUNT)
+      unfulfillableCondition = randomBytes(32)
+      this.debug(`sending unfulfillable request just to tell the other party our address and to determine the exchange rate`)
     } else {
       // Both sides are satisfied (for now)
       // TODO should we close the socket now?
@@ -286,27 +302,60 @@ export class PaymentSocket extends EventEmitter {
       this.sendAddress = false
     }
 
+    // Use the exchange rate to set the minDestinationAmount the receiver will accept
+    let minDestinationAmount
+    if (this._exchangeRate) {
+      minDestinationAmount = sourceAmount
+        .times(this._exchangeRate)
+        .times(new BigNumber(1).minus(this.slippage))
+        .decimalPlaces(0, BigNumber.ROUND_FLOOR)
+      minDestinationAmount = forceValueToBeBetween(minDestinationAmount, 0, MAX_UINT64)
+    } else if (unfulfillableCondition) {
+      minDestinationAmount = MAX_UINT64
+    } else {
+      minDestinationAmount = new BigNumber(0)
+    }
+
     // Send the chunk
     const result = await PSK2.sendRequest(this.plugin, {
       destinationAccount: this.peerDestinationAccount,
       sharedSecret: this._sharedSecret,
       sourceAmount: sourceAmount.toString(),
-      data: serializeChunkData(chunkData)
+      data: serializeChunkData(chunkData),
+      unfulfillableCondition,
+      minDestinationAmount: minDestinationAmount.toString()
       // TODO set minDestinationAmount based on exchange rate
     })
+    // we need to convert to string just because the BigNumber version used by PSK2 right now is incompatible with the one this module uses :/
+    const destinationAmount = new BigNumber(result.destinationAmount.toString(10))
 
     this.parseChunkData(result.data)
 
+    // Determine exchange rate
+    // Right now this will only be done on the first chunk and won't change from there
+    // TODO should the exchange rate be allowed to change with each chunk?
+    // (we need to make sure connectors can't just make each chunk progressively worse by the slippage amount)
+    if (!this._exchangeRate && destinationAmount.isGreaterThan(0)) {
+      this._exchangeRate = destinationAmount.dividedBy(sourceAmount)
+      this.debug(`determined exchange rate to be: ${this._exchangeRate}`)
+    }
+
     if (!PSK2.isPskError(result)) {
       this._totalSent = this._totalSent.plus(sourceAmount)
-      this._totalDelivered = this._totalDelivered.plus(result.destinationAmount.toString())
+      this._totalDelivered = this._totalDelivered.plus(destinationAmount)
       this._balance = this._balance.minus(sourceAmount)
       this.debug(`sent chunk of ${sourceAmount}, balance is now: ${this._balance} (minBalance: ${this._minBalance}, maxBalance: ${this._maxBalance}, peerExpects: ${this.peerExpects}, peerWants: ${this.peerWants})`)
       this.emit('outgoing_chunk', sourceAmount.toString())
       this.emit('chunk')
 
-      // TODO determine exchange rate
       // TODO determine how much more the receiver is waiting for
+    } else if (unfulfillableCondition) {
+      this.debug(`request was rejected because it was unfulfillable`)
+    } else if (destinationAmount.isGreaterThan(0) && minDestinationAmount.isGreaterThan(result.destinationAmount.toString(10))) {
+      // Receiver rejected because too little arrived
+      this.debug(`receiver rejected packet because too little arrived. actual destination amount: ${result.destinationAmount}, expected: ${minDestinationAmount} (sourceAmount: ${sourceAmount}, expected exchange rate: ${this._exchangeRate})`)
+      this.emit('error', new Error(`Exchange rate changed too much, not sending any more. Actual rate: ${destinationAmount.dividedBy(sourceAmount)}, expected: ${this._exchangeRate}`))
+      shouldContinue = false
     } else {
       // TODO handle errors
       this.debug(`sending chunk failed with code: ${result.code}`)
@@ -334,16 +383,31 @@ export class PaymentSocket extends EventEmitter {
     }
 
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error('Timed out without stabilizing')), timeout)
-
-      this.once('stabilized', () => {
+      const timer = setTimeout(() => {
+        cleanup.bind(this)()
+        reject(new Error('Timed out without stabilizing'))
+      }, timeout)
+      const errorListener = (err: Error) => {
+        cleanup.bind(this)()
+        reject(err)
+      }
+      const stabilizedListener = () => {
+        cleanup.bind(this)()
         if (!this.isStabilized()) {
           reject(new Error(`Stopped outside of the balance window. Current balance is: ${this._balance}, minBalance: ${this._minBalance}, maxBalance: ${this._maxBalance}`))
         } else {
-          clearTimeout(timer)
           resolve()
         }
-      })
+      }
+
+      function cleanup () {
+        clearTimeout(timer)
+        this.removeListener('error', errorListener)
+        this.removeListener('stabilized', stabilizedListener)
+      }
+
+      this.on('error', errorListener)
+      this.once('stabilized', stabilizedListener)
     }) as Promise<void>
   }
 
@@ -372,7 +436,8 @@ export class PaymentSocket extends EventEmitter {
 }
 
 export interface ServerCreateSocketOpts {
-  enableRefunds?: boolean
+  enableRefunds?: boolean,
+  slippage?: BigNumber.Value
 }
 
 export interface PaymentServerOpts {
@@ -421,7 +486,8 @@ export class PaymentServer {
       destinationAccount,
       sharedSecret,
       enableRefunds: opts.enableRefunds,
-      identity: 'sever'
+      identity: 'sever',
+      slippage: (opts.slippage !== undefined ? new BigNumber(opts.slippage) : undefined)
     })
     this.sockets.set(socketId.toString('hex'), socket)
     this.debug(`created new socket with id: ${socketId.toString('hex')}`)
@@ -467,7 +533,8 @@ export interface CreateSocketOpts {
   sharedSecret: Buffer,
   minBalance?: BigNumber.Value,
   maxBalance?: BigNumber.Value,
-  enableRefunds?: boolean
+  enableRefunds?: boolean,
+  slippage?: BigNumber.Value
 }
 
 export async function createSocket (opts: CreateSocketOpts) {
@@ -486,7 +553,8 @@ export async function createSocket (opts: CreateSocketOpts) {
     peerDestinationAccount: opts.destinationAccount,
     sendAddress: true,
     enableRefunds: opts.enableRefunds,
-    identity: 'client'
+    identity: 'client',
+    slippage: (opts.slippage !== undefined ? new BigNumber(opts.slippage) : undefined)
   })
   if (opts.minBalance !== undefined) {
     socket.setMinBalance(opts.minBalance)

@@ -214,6 +214,41 @@ describe('PaymentSocket', function () {
       assert.equal(this.serverSocket.balance, '0')
     })
   })
+
+  describe('Exchange rate handling', function () {
+    it.skip('should determine the exchange rate when the socket is connected', async function () {
+
+    })
+
+    it('should emit an "error" and reject the stabilized promise if the exchange rate changes too much', async function () {
+      const spy = sinon.spy()
+      this.clientSocket.on('error', spy)
+      this.clientSocket.setMinAndMaxBalance(-1000)
+      await this.clientSocket.stabilized()
+
+      this.pluginA.exchangeRate = 0.25
+
+      this.clientSocket.setMinAndMaxBalance(-2000)
+      let errored = false
+      try {
+        await this.clientSocket.stabilized()
+      } catch (err) {
+        errored = true
+      }
+      assert(errored)
+      assert(spy.called)
+    })
+
+    it('should allow the exchange rate to move by the specified slippage', async function () {
+      this.clientSocket.setMinAndMaxBalance(-1000)
+      await this.clientSocket.stabilized()
+
+      this.pluginA.exchangeRate = 0.495
+
+      this.clientSocket.setMinAndMaxBalance(-2000)
+      await this.clientSocket.stabilized()
+    })
+  })
 })
 
 describe('PaymentServer', function () {
