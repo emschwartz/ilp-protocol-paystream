@@ -4,7 +4,10 @@ const crypto = require('crypto')
 
 async function run () {
   const receiverPlugin = new IlpPluginBtp({ server: 'btp+ws://:receiver@localhost:7768' })
-  const server = new PaymentServer(receiverPlugin, crypto.randomBytes(32))
+  const server = new PaymentServer({
+    plugin: receiverPlugin,
+    secret: crypto.randomBytes(32)
+  })
   await server.connect()
   const receiverSocket = server.createSocket({
     enableRefunds: true
