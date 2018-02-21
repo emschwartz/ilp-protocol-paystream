@@ -72,12 +72,7 @@ export class PaymentSocket extends EventEmitter {
     this.enableRefunds = !!opts.enableRefunds
     this.slippage = opts.slippage || new BigNumber(0.01)
     this.connected = false
-    this.debug(`new socket created with minBalance ${this._minBalance}, maxBalance ${this._maxBalance}, slippage: ${this.slippage}, and refunds ${this.enableRefunds ? 'enabled' :  'disabled'}`)
-
-
-    if (this.sendAddress) {
-      this.maybeSend()
-    }
+    this.debug(`new socket created with minBalance ${this._minBalance}, maxBalance ${this._maxBalance}, slippage: ${this.slippage}, and refunds ${this.enableRefunds ? 'enabled' : 'disabled'}`)
   }
 
   get destinationAccount (): string {
@@ -193,6 +188,7 @@ export class PaymentSocket extends EventEmitter {
 
       this.once('error', errorListener)
       this.once('connect', connectListener)
+      /* tslint:disable-next-line:no-unnecessary-type-assertion */
     }) as Promise<void>
   }
 
@@ -234,6 +230,7 @@ export class PaymentSocket extends EventEmitter {
 
       this.once('error', errorListener)
       this.once('stabilized', stabilizedListener)
+      /* tslint:disable-next-line:no-unnecessary-type-assertion */
     }) as Promise<void>
   }
 
@@ -293,7 +290,6 @@ export class PaymentSocket extends EventEmitter {
       amountWanted
       // don't include destinationAccount or sharedSecret because the other side already knows it
     }))
-
 
     if (requestAmount.isGreaterThan(0)) {
       this.emit('chunk')
@@ -557,6 +553,7 @@ export class PaymentServer {
     this.debug('disconnected')
   }
 
+  // TODO should this be async and return an already connected socket?
   createSocket (opts?: ServerCreateSocketOpts): PaymentSocket {
     if (!opts) {
       opts = {}
@@ -624,7 +621,7 @@ export async function createSocket (opts: CreateSocketOpts) {
   const debug = Debug('ilp-protocol-paystream:createSocket')
   let socket: PaymentSocket
   const receiver = await PSK2.createReceiver({
-    plugin: opts.plugin,
+    plugin: opts.plugin
   })
   const { destinationAccount } = receiver.registerRequestHandlerForSecret(opts.sharedSecret, (request: PSK2.RequestHandlerParams) => {
     return socket.handleRequest(request)
@@ -652,6 +649,9 @@ export async function createSocket (opts: CreateSocketOpts) {
 
   /* tslint:disable-next-line:no-floating-promises */
   socket.once('close', () => receiver.disconnect())
+
+  // TODO should we let the user call connect instead?
+  await socket.connect()
 
   return socket
 }
