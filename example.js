@@ -3,7 +3,7 @@ const IlpPluginBtp = require('ilp-plugin-btp')
 const crypto = require('crypto')
 
 async function run () {
-  const receiverPlugin = new IlpPluginBtp({ server: 'btp+ws://:receiver@localhost:7768' })
+  const receiverPlugin = new IlpPluginBtp({ server: `btp+wss://:${crypto.randomBytes(16).toString('hex')}@amundsen.ilpdemo.org:1810` })
   const server = new PaymentServer({
     plugin: receiverPlugin,
     secret: crypto.randomBytes(32)
@@ -14,7 +14,7 @@ async function run () {
   })
   receiverSocket.setMaxBalance(4000)
 
-  const senderPlugin = new IlpPluginBtp({ server: 'btp+ws://:sender@localhost:7768' })
+  const senderPlugin = new IlpPluginBtp({ server: `btp+wss://:${crypto.randomBytes(16).toString('hex')}@amundsen.ilpdemo.org:1810` })
   const senderSocket = await createSocket({
     plugin: senderPlugin,
     destinationAccount: receiverSocket.destinationAccount,
