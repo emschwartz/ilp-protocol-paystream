@@ -112,14 +112,12 @@ export class PaymentSocket extends EventEmitter {
     // which should be no worse than the exchange rate we first saw less the configured slippage
     if (this._totalDelivered.isGreaterThan(0)) {
       return this._totalDelivered.dividedBy(this._totalSent).toString()
-    } else if (this._exchangeRate) {
-      return this._exchangeRate.toString()
     } else {
-      return '0'
+      return this._exchangeRate.toString()
     }
   }
 
-  get isConnected (): boolean {
+  isConnected (): boolean {
     return this.connected
   }
 

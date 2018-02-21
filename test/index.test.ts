@@ -99,6 +99,12 @@ describe('PaymentSocket', function () {
 			assert(threw)
 		})
 
+    it('should allow the user to check if the socket is connected', async function () {
+      assert.equal(this.serverSocket.isConnected(), false)
+      await this.serverSocket.connect()
+      assert.equal(this.serverSocket.isConnected(), true)
+    })
+
     it.skip('should timeout after the specified timeout', async function () {
 
     })
