@@ -428,7 +428,45 @@ describe('PaymentSocket', function () {
       assert.equal(spy.callCount, 1)
     })
 
-    it.skip('should retry on temporary errors')
+    it('should retry on temporary errors up to the specified maxRetries and then emit an error', async function () {
+      let clock: sinon.SinonFakeTimers
+      const interval = setInterval(() => {
+        if (clock) {
+          clock.tick(1000)
+        }
+      })
+      clock = sinon.useFakeTimers()
+
+      this.clientSocket.close()
+      const clientSocket = await createSocket({
+        plugin: this.pluginA,
+        destinationAccount: this.serverSocket.destinationAccount,
+        sharedSecret: this.serverSocket.sharedSecret,
+        maxRetries: 7
+      })
+
+      const spy = sinon.spy()
+      clientSocket.on('error', spy)
+
+      const sendDataStub = sinon.stub(this.pluginA, 'sendData')
+        .resolves(IlpPacket.serializeIlpReject({
+          code: 'T00',
+          message: 'Internal Server Error',
+          data: Buffer.alloc(0),
+          triggeredBy: 'test.connector'
+        }))
+
+      clientSocket.setMinAndMaxBalance(-1000)
+      try {
+        await clientSocket.stabilized()
+      } catch (err) {
+      }
+
+      assert.equal(sendDataStub.callCount, 7)
+      assert.equal(spy.callCount, 1)
+      clock.restore()
+      clearInterval(interval)
+    })
 
     it.skip('should close the socket if it gets an unexpected error')
   })

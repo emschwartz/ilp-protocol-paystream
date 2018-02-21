@@ -9,6 +9,8 @@ import * as Long from 'long'
 const MAX_UINT64 = new BigNumber('18446744073709551615')
 const DEFAULT_STABILIZED_TIMEOUT = 60000
 const PROBE_AMOUNT = 1000
+const STARTING_RETRY_TIMEOUT = 100
+const RETRY_TIMEOUT_INCREASE_FACTOR = 2
 
 export interface PaymentSocketOpts {
   // TODO make sure this is a PluginV2
@@ -20,7 +22,8 @@ export interface PaymentSocketOpts {
   sendAddress?: boolean,
   enableRefunds?: boolean,
   identity?: string,
-  slippage?: BigNumber
+  slippage?: BigNumber,
+  maxRetries?: number
 }
 
 export class PaymentSocket extends EventEmitter {
@@ -45,6 +48,9 @@ export class PaymentSocket extends EventEmitter {
   protected enableRefunds: boolean
   protected slippage: BigNumber
   protected connected: boolean
+  protected consecutiveRejectedRequests: number
+  protected maxRetries: number
+  protected retryTimeout: number
   // TODO expose the number of chunks sent/received or fulfilled/rejected?
 
   constructor (opts: PaymentSocketOpts) {
@@ -72,6 +78,9 @@ export class PaymentSocket extends EventEmitter {
     this.enableRefunds = !!opts.enableRefunds
     this.slippage = opts.slippage || new BigNumber(0.01)
     this.connected = false
+    this.consecutiveRejectedRequests = 0
+    this.maxRetries = (typeof opts.maxRetries === 'number' ? opts.maxRetries : 5)
+    this.retryTimeout = STARTING_RETRY_TIMEOUT
     this.debug(`new socket created with minBalance ${this._minBalance}, maxBalance ${this._maxBalance}, slippage: ${this.slippage}, and refunds ${this.enableRefunds ? 'enabled' : 'disabled'}`)
   }
 
@@ -462,7 +471,10 @@ export class PaymentSocket extends EventEmitter {
       this.emit('connect')
     }
 
+    // Handle fulfillment or specific types of rejections
     if (!PSK2.isPskError(result)) {
+      // Request was fulfilled
+
       this._totalSent = this._totalSent.plus(sourceAmount)
       this._totalDelivered = this._totalDelivered.plus(destinationAmount)
       this._balance = this._balance.minus(sourceAmount)
@@ -470,17 +482,40 @@ export class PaymentSocket extends EventEmitter {
       this.emit('outgoing_chunk', sourceAmount.toString())
       this.emit('chunk')
 
-      // TODO determine how much more the receiver is waiting for
+      // This request succeeded to reset our retry-related variables
+      this.consecutiveRejectedRequests = 0
+      this.retryTimeout = STARTING_RETRY_TIMEOUT
     } else if (unfulfillableCondition) {
+      // We sent an unfulfillable test payment so of course it was rejected
+
       this.debug(`request was rejected because it was unfulfillable`)
     } else if (destinationAmount.isGreaterThan(0) && minDestinationAmount.isGreaterThan(result.destinationAmount.toString(10))) {
       // Receiver rejected because too little arrived
+
       this.debug(`receiver rejected packet because too little arrived. actual destination amount: ${result.destinationAmount}, expected: ${minDestinationAmount} (sourceAmount: ${sourceAmount}, expected exchange rate: ${this._exchangeRate})`)
       this.emit('error', new Error(`Exchange rate changed too much, not sending any more. Actual rate: ${destinationAmount.dividedBy(sourceAmount)}, expected: ${this._exchangeRate}`))
+
       shouldContinue = false
+      this.consecutiveRejectedRequests += 1
+    } else if (result.code[0].toUpperCase() === 'T') {
+      // Retry on temporary rejection codes
+
+      this.consecutiveRejectedRequests += 1
+      if (this.consecutiveRejectedRequests < this.maxRetries) {
+        this.debug(`got temporary error code: ${result.code}, message: ${result.message}. waiting ${this.retryTimeout}ms before retrying`)
+        await new Promise((resolve, reject) => setTimeout(resolve, this.retryTimeout))
+        this.retryTimeout = this.retryTimeout * RETRY_TIMEOUT_INCREASE_FACTOR
+      } else {
+        this.debug(`packet was rejected ${this.consecutiveRejectedRequests} times in a row, not retrying anymore`)
+        this.emit('error', new Error(`Sending chunk failed with code: ${result.code} and message: ${result.message}. Retried ${this.consecutiveRejectedRequests} times but each was rejected`))
+        shouldContinue = false
+      }
     } else {
+      // Unexpected error
+
       this.debug(`sending chunk failed with code: ${result.code} and message: ${result.message}`)
       this.emit('error', new Error(`Sending chunk failed with code: ${result.code} and message: ${result.message}`))
+      this.consecutiveRejectedRequests += 1
       shouldContinue = false
     }
 
@@ -515,7 +550,8 @@ export class PaymentSocket extends EventEmitter {
 
 export interface ServerCreateSocketOpts {
   enableRefunds?: boolean,
-  slippage?: BigNumber.Value
+  slippage?: BigNumber.Value,
+  maxRetries?: number
 }
 
 export interface PaymentServerOpts {
@@ -561,10 +597,10 @@ export class PaymentServer {
     const socketId = randomBytes(18)
     const { destinationAccount, sharedSecret } = this.receiver.generateAddressAndSecret(socketId)
     const socket = new PaymentSocket({
+      ...opts,
       plugin: this.plugin,
       destinationAccount,
       sharedSecret,
-      enableRefunds: opts.enableRefunds,
       identity: 'sever',
       slippage: (opts.slippage !== undefined ? new BigNumber(opts.slippage) : undefined)
     })
@@ -613,7 +649,8 @@ export interface CreateSocketOpts {
   minBalance?: BigNumber.Value,
   maxBalance?: BigNumber.Value,
   enableRefunds?: boolean,
-  slippage?: BigNumber.Value
+  slippage?: BigNumber.Value,
+  maxRetries?: number
 }
 
 export async function createSocket (opts: CreateSocketOpts) {
@@ -633,7 +670,8 @@ export async function createSocket (opts: CreateSocketOpts) {
     sendAddress: true,
     enableRefunds: opts.enableRefunds,
     identity: 'client',
-    slippage: (opts.slippage !== undefined ? new BigNumber(opts.slippage) : undefined)
+    slippage: (opts.slippage !== undefined ? new BigNumber(opts.slippage) : undefined),
+    maxRetries: opts.maxRetries
   })
   if (opts.minBalance !== undefined) {
     socket.setMinBalance(opts.minBalance)
