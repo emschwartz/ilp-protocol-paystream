@@ -479,8 +479,9 @@ export class PaymentSocket extends EventEmitter {
       this.emit('error', new Error(`Exchange rate changed too much, not sending any more. Actual rate: ${destinationAmount.dividedBy(sourceAmount)}, expected: ${this._exchangeRate}`))
       shouldContinue = false
     } else {
-      // TODO handle errors
-      this.debug(`sending chunk failed with code: ${result.code}`)
+      this.debug(`sending chunk failed with code: ${result.code} and message: ${result.message}`)
+      this.emit('error', new Error(`Sending chunk failed with code: ${result.code} and message: ${result.message}`))
+      shouldContinue = false
     }
 
     this.sending = false

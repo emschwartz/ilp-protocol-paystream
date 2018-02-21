@@ -3,6 +3,7 @@ import { assert } from 'chai'
 import { createSocket, createServer, PaymentServer, PaymentSocket } from '../src/index'
 import MockPlugin from './mocks/plugin'
 import * as sinon from 'sinon'
+import * as IlpPacket from 'ilp-packet'
 
 describe('PaymentSocket', function () {
   beforeEach(async function () {
@@ -396,6 +397,40 @@ describe('PaymentSocket', function () {
       // average of the two rates
       assert.equal(this.clientSocket.exchangeRate, '0.4975')
     })
+  })
+
+  describe('Error handling', function () {
+    it('should emit an error and reject the stabilized Promise if it gets a reject with a final error code', async function () {
+      const spy = sinon.spy()
+      this.clientSocket.on('error', spy)
+
+      const sendDataStub = sinon.stub(this.pluginA, 'sendData')
+        .onSecondCall()
+        .resolves(IlpPacket.serializeIlpReject({
+          code: 'F00',
+          message: 'Bad Request',
+          data: Buffer.alloc(0),
+          triggeredBy: 'test.connector'
+        }))
+        .callThrough()
+
+      this.clientSocket.setMinAndMaxBalance(-2000)
+
+      let errored = false
+      try {
+        await this.clientSocket.stabilized()
+      } catch (err) {
+        errored = true
+      }
+
+      assert.equal(sendDataStub.callCount, 2)
+      assert.equal(errored, true)
+      assert.equal(spy.callCount, 1)
+    })
+
+    it.skip('should retry on temporary errors')
+
+    it.skip('should close the socket if it gets an unexpected error')
   })
 })
 
