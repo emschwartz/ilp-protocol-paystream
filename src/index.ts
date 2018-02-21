@@ -44,6 +44,7 @@ export class PaymentSocket extends EventEmitter {
   protected sendAddress: boolean
   protected enableRefunds: boolean
   protected slippage: BigNumber
+  protected connected: boolean
   // TODO expose the number of chunks sent/received or fulfilled/rejected?
 
   constructor (opts: PaymentSocketOpts) {
@@ -69,8 +70,10 @@ export class PaymentSocket extends EventEmitter {
     this.sending = false
     this.sendAddress = !!opts.sendAddress
     this.enableRefunds = !!opts.enableRefunds
-    this.debug(`new socket created with minBalance ${this._minBalance}, maxBalance ${this._maxBalance}, and refunds ${this.enableRefunds ? 'enabled' :  'disabled'}`)
     this.slippage = opts.slippage || new BigNumber(0.01)
+    this.connected = false
+    this.debug(`new socket created with minBalance ${this._minBalance}, maxBalance ${this._maxBalance}, slippage: ${this.slippage}, and refunds ${this.enableRefunds ? 'enabled' :  'disabled'}`)
+
 
     if (this.sendAddress) {
       this.maybeSend()
@@ -105,6 +108,26 @@ export class PaymentSocket extends EventEmitter {
     return this._totalDelivered.toString()
   }
 
+  get exchangeRate (): string {
+    if (!this.connected) {
+      throw new Error('Must be connected to get exchangeRate')
+    }
+
+    // This is the real rate that we've been delivering money based on,
+    // which should be no worse than the exchange rate we first saw less the configured slippage
+    if (this._totalDelivered.isGreaterThan(0)) {
+      return this._totalDelivered.dividedBy(this._totalSent).toString()
+    } else if (this._exchangeRate) {
+      return this._exchangeRate.toString()
+    } else {
+      return '0'
+    }
+  }
+
+  get isConnected (): boolean {
+    return this.connected
+  }
+
   setMinBalance (amount: BigNumber.Value): void {
     if (this._maxBalance.isLessThan(amount)) {
       throw new Error(`Cannot set minBalance lower than maxBalance (${this._maxBalance})`)
@@ -136,10 +159,89 @@ export class PaymentSocket extends EventEmitter {
     this.maybeSend()
   }
 
+  async connect (timeout = DEFAULT_STABILIZED_TIMEOUT): Promise<void> {
+    if (this.closed) {
+      return Promise.reject(new Error('Socket is already closed'))
+    }
+
+    if (this.connected) {
+      return Promise.resolve()
+    }
+
+    /* tslint:disable-next-line:no-floating-promises */
+    this.maybeSend()
+
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        cleanup.call(this)
+        reject(new Error('Connect timed out'))
+      }, timeout)
+      const errorListener = (err: Error) => {
+        cleanup.call(this)
+        reject(err)
+      }
+      const connectListener = () => {
+        cleanup.call(this)
+        resolve()
+      }
+
+      function cleanup () {
+        clearTimeout(timer)
+        this.removeListener('error', errorListener)
+        this.removeListener('connect', connectListener)
+      }
+
+      this.once('error', errorListener)
+      this.once('connect', connectListener)
+    }) as Promise<void>
+  }
+
   close () {
     this.debug(`closing payment socket with destinationAccount: ${this._destinationAccount}`)
     this.closed = true
+    this.connected = false
     this.emit('close')
+  }
+
+  async stabilized (timeout = DEFAULT_STABILIZED_TIMEOUT): Promise<void> {
+    if (this.isStabilized()) {
+      return Promise.resolve()
+    }
+
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        cleanup.call(this)
+        reject(new Error('Timed out without stabilizing'))
+      }, timeout)
+      const errorListener = (err: Error) => {
+        cleanup.call(this)
+        reject(err)
+      }
+      const stabilizedListener = () => {
+        cleanup.call(this)
+        if (!this.isStabilized()) {
+          reject(new Error(`Stopped outside of the balance window. Current balance is: ${this._balance}, minBalance: ${this._minBalance}, maxBalance: ${this._maxBalance}`))
+        } else {
+          resolve()
+        }
+      }
+
+      function cleanup () {
+        clearTimeout(timer)
+        this.removeListener('error', errorListener)
+        this.removeListener('stabilized', stabilizedListener)
+      }
+
+      this.once('error', errorListener)
+      this.once('stabilized', stabilizedListener)
+    }) as Promise<void>
+  }
+
+  isStabilized (): boolean {
+    return !this.sending
+      && this._balance.isLessThanOrEqualTo(this._maxBalance)
+      && this._balance.isGreaterThanOrEqualTo(this._minBalance)
+      && (this.peerExpects.isEqualTo(0) || this._balance.isEqualTo(this._minBalance))
   }
 
   async handleRequest (request: PSK2.RequestHandlerParams): Promise<void> {
@@ -162,12 +264,14 @@ export class PaymentSocket extends EventEmitter {
       }))
     }
 
-    if (request.amount.eq(0) && this._balance.isLessThan(this._minBalance)) {
+    // We've requested more money than the other side's minBalance allows them to send
+    if (requestAmount.isEqualTo(0) && this._balance.isLessThan(this._minBalance)) {
       this.debug(`requested money from other party but they aren't sending it. current balance: ${this._balance}, minBalance: ${this._minBalance}`)
       // TODO is this always an error? What if we changed the limit between now and when the other side sent this request?
       this.emit('error', new Error(`Requested money from other party but they aren't sending it. Current balance: ${this._balance}, expected: ${this._minBalance}`))
     }
 
+    // The other side has exceeded our maxBalance
     if (requestAmount.isGreaterThan(0) && this._balance.isGreaterThanOrEqualTo(this._maxBalance)) {
       this.debug(`rejecting request because balance is already: ${this._balance} (minBalance: ${this._minBalance}, maxBalance: ${this._maxBalance})`)
       return request.reject(serializeChunkData({
@@ -215,7 +319,7 @@ export class PaymentSocket extends EventEmitter {
     }
   }
 
-  protected async maybeSend (): Promise<void> {
+  protected async maybeSend (forceSend = false): Promise<void> {
     // Start on the next tick of the event loop
     // This ensures that if someone calls "await socket.stabilized" right after changing the limit
     // the "stabilized" event will fire _after_ the listener has been added
@@ -249,6 +353,7 @@ export class PaymentSocket extends EventEmitter {
       })
       if (!this.peerDestinationAccount) {
         this.debug('did not get destinationAccount from other side within timeout, closing socket')
+        this.emit('error', new Error('Did not get destinationAccount from other party within timeout'))
         this.close()
         return
       }
@@ -294,8 +399,8 @@ export class PaymentSocket extends EventEmitter {
         shouldContinue = false
       }
       this.debug(`sending ${sourceAmount} because peer requested payment`)
-    } else if (this.sendAddress) {
-      // Send a dummy request just to tell the other side our details
+    } else if (this.sendAddress || !this._exchangeRate) {
+      // Send a dummy request just to tell the other side our details and determine the exchange rate
       // TODO the initialization call should just be separate from this flow
       sourceAmount = new BigNumber(PROBE_AMOUNT)
       unfulfillableCondition = randomBytes(32)
@@ -328,6 +433,7 @@ export class PaymentSocket extends EventEmitter {
         .times(new BigNumber(1).minus(this.slippage))
         .decimalPlaces(0, BigNumber.ROUND_FLOOR)
       minDestinationAmount = forceValueToBeBetween(minDestinationAmount, 0, MAX_UINT64)
+      this.debug(`setting minDestinationAmount to ${minDestinationAmount}, based on an exchange rate of ${this._exchangeRate} and slippage of ${this.slippage.times(100)}%`)
     } else if (unfulfillableCondition) {
       minDestinationAmount = MAX_UINT64
     } else {
@@ -356,6 +462,10 @@ export class PaymentSocket extends EventEmitter {
     if (!this._exchangeRate && destinationAmount.isGreaterThan(0)) {
       this._exchangeRate = destinationAmount.dividedBy(sourceAmount)
       this.debug(`determined exchange rate to be: ${this._exchangeRate}`)
+
+      // Emit the connect event now because getting the exchange rate is the first thing we'll do
+      this.connected = true
+      this.emit('connect')
     }
 
     if (!PSK2.isPskError(result)) {
@@ -389,51 +499,6 @@ export class PaymentSocket extends EventEmitter {
     } else {
       this.debug('socket is not yet stabilized, but not continuing to send')
     }
-  }
-
-  async stabilized (timeout?: number): Promise<void> {
-    if (timeout === undefined) {
-      timeout = DEFAULT_STABILIZED_TIMEOUT
-    }
-
-    if (this.isStabilized()) {
-      return Promise.resolve()
-    }
-
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        cleanup.bind(this)()
-        reject(new Error('Timed out without stabilizing'))
-      }, timeout)
-      const errorListener = (err: Error) => {
-        cleanup.bind(this)()
-        reject(err)
-      }
-      const stabilizedListener = () => {
-        cleanup.bind(this)()
-        if (!this.isStabilized()) {
-          reject(new Error(`Stopped outside of the balance window. Current balance is: ${this._balance}, minBalance: ${this._minBalance}, maxBalance: ${this._maxBalance}`))
-        } else {
-          resolve()
-        }
-      }
-
-      function cleanup () {
-        clearTimeout(timer)
-        this.removeListener('error', errorListener)
-        this.removeListener('stabilized', stabilizedListener)
-      }
-
-      this.on('error', errorListener)
-      this.once('stabilized', stabilizedListener)
-    }) as Promise<void>
-  }
-
-  isStabilized (): boolean {
-    return !this.sending
-      && this._balance.isLessThanOrEqualTo(this._maxBalance)
-      && this._balance.isGreaterThanOrEqualTo(this._minBalance)
-      && (this.peerExpects.isEqualTo(0) || this._balance.isEqualTo(this._minBalance))
   }
 
   protected parseChunkData (data: Buffer): void {

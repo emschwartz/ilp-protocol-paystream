@@ -54,6 +54,58 @@ describe('PaymentSocket', function () {
       assert.typeOf(this.clientSocket.totalDelivered, 'string')
       assert.throws(() => this.clientSocket.totalDelivered = '10')
     })
+
+    it('should export the exchangeRate as a string but not allow it to be modified', function () {
+      assert.typeOf(this.clientSocket.exchangeRate, 'string')
+      assert.throws(() => this.clientSocket.exchangeRate = '10')
+    })
+
+		it('should throw an error if the exchangeRate is accessed before the socket is connected', function () {
+			assert.throws(() => {
+				let e = this.serverSocket.exchangeRate
+			})
+		})
+  })
+
+  describe('connect', function () {
+    it('should resolve on the client side when the exchange rate is known', async function () {
+      await this.clientSocket.connect()
+      assert.equal(this.clientSocket.exchangeRate, '0.5')
+    })
+
+    it('should resolve on the server side when the destination account and exchange rate are known', async function () {
+      await this.serverSocket.connect()
+      assert(this.serverSocket.destinationAccount)
+      assert.equal(this.serverSocket.exchangeRate, '2')
+    })
+
+		it('should resolve if it is already connected', async function () {
+			await this.clientSocket.connect()
+			const spy = sinon.spy(this.pluginA, 'sendData')
+			await this.clientSocket.connect()
+
+			assert(spy.notCalled)
+		})
+
+		it('should throw an error if the socket is already closed', async function () {
+			await this.clientSocket.connect()
+			this.clientSocket.close()
+			let threw = false
+			try {
+				await this.clientSocket.connect()
+			} catch (err) {
+				threw = true
+			}
+			assert(threw)
+		})
+
+    it.skip('should timeout after the specified timeout', async function () {
+
+    })
+
+    it.skip('should timeout after 60 seconds by default', async function () {
+
+    })
   })
 
   describe('close', function () {
@@ -244,7 +296,7 @@ describe('PaymentSocket', function () {
 
     it('should allow the payer to request their money back if enabled', async function () {
       this.clientSocket.close()
-      const clientSocket = createSocket({
+      const clientSocket = await createSocket({
         plugin: this.pluginA,
         destinationAccount: this.serverSocket.destinationAccount,
         sharedSecret: this.serverSocket.sharedSecret,
@@ -263,8 +315,20 @@ describe('PaymentSocket', function () {
   })
 
   describe('Exchange rate handling', function () {
-    it.skip('should determine the exchange rate when the socket is connected', async function () {
+    it('should determine the exchange rate when the client socket is connected', async function () {
+      this.clientSocket.close()
+      const clientSocket = await createSocket({
+        plugin: this.pluginA,
+        destinationAccount: this.serverSocket.destinationAccount,
+        sharedSecret: this.serverSocket.sharedSecret
+      })
+      await clientSocket.connect()
+      assert.equal(clientSocket.exchangeRate, '0.5')
+    })
 
+    it('should determine the exchange rate when the server socket is connected', async function () {
+      await this.serverSocket.connect()
+      assert.equal(this.serverSocket.exchangeRate, '2')
     })
 
     it('should emit an "error" and reject the stabilized promise if the exchange rate changes too much', async function () {
@@ -287,6 +351,24 @@ describe('PaymentSocket', function () {
     })
 
     it('should allow the exchange rate to move by the specified slippage', async function () {
+      this.clientSocket.close()
+      const clientSocket = await createSocket({
+        plugin: this.pluginA,
+        destinationAccount: this.serverSocket.destinationAccount,
+        sharedSecret: this.serverSocket.sharedSecret,
+        slippage: 0.5
+      })
+
+      clientSocket.setMinAndMaxBalance(-1000)
+      await clientSocket.stabilized()
+
+      this.pluginA.exchangeRate = 0.25
+
+      clientSocket.setMinAndMaxBalance(-2000)
+      await clientSocket.stabilized()
+    })
+
+    it('should default to allowing 1% slippage', async function () {
       this.clientSocket.setMinAndMaxBalance(-1000)
       await this.clientSocket.stabilized()
 
@@ -294,6 +376,19 @@ describe('PaymentSocket', function () {
 
       this.clientSocket.setMinAndMaxBalance(-2000)
       await this.clientSocket.stabilized()
+    })
+
+    it('should expose the exchange rate discovered through sending', async function () {
+      this.clientSocket.setMinAndMaxBalance(-1000)
+      await this.clientSocket.stabilized()
+
+      this.pluginA.exchangeRate = 0.495
+
+      this.clientSocket.setMinAndMaxBalance(-2000)
+      await this.clientSocket.stabilized()
+
+      // average of the two rates
+      assert.equal(this.clientSocket.exchangeRate, '0.4975')
     })
   })
 })
