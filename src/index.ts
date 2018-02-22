@@ -112,7 +112,7 @@ export class PaymentSocket extends EventEmitter {
     return this._totalDelivered.toString()
   }
 
-  get exchangeRate (): string {
+  getExchangeRate (): string {
     if (!this.connected) {
       throw new Error('Must be connected to get exchangeRate')
     }
