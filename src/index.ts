@@ -51,6 +51,7 @@ export class PaymentSocket extends EventEmitter {
   protected consecutiveRejectedRequests: number
   protected maxRetries: number
   protected retryTimeout: number
+  protected requestId: number
   // TODO expose the number of chunks sent/received or fulfilled/rejected?
 
   constructor (opts: PaymentSocketOpts) {
@@ -81,6 +82,7 @@ export class PaymentSocket extends EventEmitter {
     this.consecutiveRejectedRequests = 0
     this.maxRetries = (typeof opts.maxRetries === 'number' ? opts.maxRetries : 5)
     this.retryTimeout = STARTING_RETRY_TIMEOUT
+    this.requestId = 0
     this.debug(`new socket created with minBalance ${this._minBalance}, maxBalance ${this._maxBalance}, slippage: ${this.slippage}, and refunds ${this.enableRefunds ? 'enabled' : 'disabled'}`)
   }
 
@@ -450,7 +452,8 @@ export class PaymentSocket extends EventEmitter {
       sourceAmount: sourceAmount.toString(),
       data: serializeChunkData(chunkData),
       unfulfillableCondition,
-      minDestinationAmount: minDestinationAmount.toString()
+      minDestinationAmount: minDestinationAmount.toString(),
+      requestId: this.requestId++
       // TODO set minDestinationAmount based on exchange rate
     })
     // we need to convert to string just because the BigNumber version used by PSK2 right now is incompatible with the one this module uses :/
