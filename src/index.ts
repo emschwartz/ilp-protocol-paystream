@@ -345,16 +345,23 @@ export class PaymentSocket extends EventEmitter {
     if (!this.peerDestinationAccount) {
       this.debug('waiting for the other side to tell us their ILP address')
       await new Promise((resolve, reject) => {
-        const timeout = setTimeout(() => resolve(), this.socketTimeout)
+        const timer = setTimeout(() => {
+          cleanup.call(this)
+          resolve()
+        }, this.socketTimeout)
 
         const chunkListener = () => {
           if (this.peerDestinationAccount) {
+            cleanup.call(this)
             resolve()
-            this.removeListener('chunk', chunkListener)
-            clearTimeout(timeout)
           }
         }
         this.on('chunk', chunkListener)
+
+        function cleanup () {
+          clearTimeout(timer)
+          this.removeListener('chunk', chunkListener)
+        }
       })
       if (!this.peerDestinationAccount) {
         this.debug('did not get destinationAccount from other side within timeout, closing socket')
