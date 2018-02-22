@@ -324,7 +324,7 @@ export class PaymentSocket extends EventEmitter {
     }
   }
 
-  protected async maybeSend (forceSend = false): Promise<void> {
+  protected async maybeSend (): Promise<void> {
     // Start on the next tick of the event loop
     // This ensures that if someone calls "await socket.stabilized" right after changing the limit
     // the "stabilized" event will fire _after_ the listener has been added
