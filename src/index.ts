@@ -333,6 +333,8 @@ export class PaymentSocket extends EventEmitter {
       this.debug('already in the process of sending, not starting another send loop')
       return
     }
+    // This will be set again in maybeSend but we need to set it here before the
+    // `await Promise.resolve()` below in case startSending is called again
     this.sending = true
 
     // Wait until they've told us their address or close the socket if a timeout is reached
@@ -369,7 +371,6 @@ export class PaymentSocket extends EventEmitter {
     // This ensures that if someone calls "await socket.stabilized" right after changing the limit
     // the "stabilized" event will fire _after_ the listener has been added
     await Promise.resolve()
-
 
     try {
       await this.maybeSend()

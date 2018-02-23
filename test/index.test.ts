@@ -215,7 +215,7 @@ describe('PaymentSocket', function () {
       assert.equal(this.clientSocket.balance, '2000')
     })
 
-    it('should allow you to request more money by lowering the minimum balance further', async function () {
+    it('should allow you to request more money by raising the minimum balance further', async function () {
       this.clientSocket.setMinBalance(-4000)
       this.serverSocket.setMinAndMaxBalance(1000)
       await this.clientSocket.stabilized()
