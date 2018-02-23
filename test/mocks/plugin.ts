@@ -59,7 +59,7 @@ export default class MockPlugin extends EventEmitter {
         })
       }
       const amount = new BigNumber(parsed.amount)
-      if (this.maxAmount && amount.isGreaterThan(this.maxAmount)) {
+      if (typeof this.maxAmount === 'number' && amount.isGreaterThan(this.maxAmount)) {
         const writer = new Writer()
         writer.writeUInt64(amount.toNumber())
         writer.writeUInt64(this.maxAmount)

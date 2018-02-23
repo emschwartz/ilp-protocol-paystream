@@ -453,6 +453,40 @@ describe('PaymentSocket', function () {
       await this.clientSocket.stabilized()
       assert.equal(spy.callCount, 1)
     })
+
+    it('should stop if the MPS is too small to send any money through', async function () {
+      this.pluginA.maxAmount = 0
+      const spy = sinon.spy(this.pluginA, 'sendData')
+      this.clientSocket.setMinAndMaxBalance(-15000)
+      let errored = false
+      try {
+        await this.clientSocket.stabilized()
+      } catch (err) {
+        errored = true
+      }
+      assert.equal(errored, true)
+      assert.equal(spy.callCount, 1)
+    })
+
+    it('should use the default behavior if the connector returns non-sensical data in the F08 error', async function () {
+      this.pluginA.maxAmount = 800
+      const spy = sinon.spy(this.pluginA, 'sendData')
+      const realSendData = this.pluginA.sendData
+      this.pluginA.sendData = async (data: Buffer) => {
+        let result = await realSendData.call(this.pluginA, data)
+        if (result[0] === IlpPacket.Type.TYPE_ILP_REJECT) {
+          result = IlpPacket.serializeIlpReject({
+            ...IlpPacket.deserializeIlpReject(result),
+            data: Buffer.from('xcoivusadlfkjlwkerjlkjlkxcjvlkoiuiowedr', 'base64')
+          })
+        }
+        return result
+      }
+
+      this.clientSocket.setMinAndMaxBalance(-2000)
+      await this.clientSocket.stabilized()
+      assert.equal(spy.callCount, 5)
+    })
   })
 
   describe('Error handling', function () {

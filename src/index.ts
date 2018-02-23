@@ -527,6 +527,11 @@ export class PaymentSocket extends EventEmitter {
       try {
         const receivedAmount = highLowToBigNumber(reader.readUInt64())
         const maximumAmount = highLowToBigNumber(reader.readUInt64())
+        if (maximumAmount.isGreaterThanOrEqualTo(receivedAmount)) {
+          const errMessage = `F08 error data includes a receivedAmount (${receivedAmount}) that is less than the reported maximumAmount (${maximumAmount}), which makes no sense`
+          this.debug(errMessage)
+          throw new Error(errMessage)
+        }
 
         // If we got here without an error being thrown that means the connector
         // did actually send those values back (thanks!)
@@ -540,6 +545,12 @@ export class PaymentSocket extends EventEmitter {
         this.maxPaymentSize = sourceAmount.minus(1)
         this.nextMaxAmount = sourceAmount.times(AMOUNT_DECREASE_FACTOR).decimalPlaces(0, BigNumber.ROUND_DOWN)
         this.debug(`connector did not include receivedAmount and maximumAmount in reject, decreasing nextMaxAmount to: ${this.nextMaxAmount}`)
+      }
+
+      if (this.maxPaymentSize.isLessThanOrEqualTo(1)) {
+        this.debug(`sending through this path is impossible because the maximum packet amount appears to be zero`)
+        this.emit('error', new Error('Cannot send through this path because the maximum packet amount appears to be zero'))
+        shouldContinue = false
       }
     } else if (unfulfillableCondition) {
       // We sent an unfulfillable test payment so of course it was rejected
