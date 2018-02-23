@@ -392,6 +392,69 @@ describe('PaymentSocket', function () {
     })
   })
 
+  describe('Maximum Payment Size handling', function () {
+    it('should find the MPS immediately if the connector returns the receivedAmount and maximumAmount in the F08 reject data', async function () {
+      this.pluginA.maxAmount = 2500
+      const spy = sinon.spy(this.pluginA, 'sendData')
+
+      this.clientSocket.setMinAndMaxBalance(-5000)
+      await this.clientSocket.stabilized()
+      assert.equal(spy.callCount, 3)
+      assert.equal(IlpPacket.deserializeIlpPrepare(spy.args[1][0]).amount, '2500')
+    })
+
+    it('should find the MPS if there are multiple connectors with successively smaller MPS\'', async function () {
+      const maxAmounts = [2857, 2233, 1675]
+      const realSendData = this.pluginA.sendData
+      let callCount = 0
+      const args: Buffer[] = []
+      this.pluginA.sendData = (data: Buffer) => {
+        callCount++
+        args[callCount - 1] = data
+        if (callCount <= maxAmounts.length) {
+          this.pluginA.maxAmount = maxAmounts[callCount - 1]
+        }
+        return realSendData.call(this.pluginA, data)
+      }
+
+      this.clientSocket.setMinAndMaxBalance(-3000)
+      await this.clientSocket.stabilized()
+      // Look at the 2nd to last call, because the last one will be decreased based
+      // on how much is left to send (rather than being set to the path MPS)
+      const secondToLastCall = args[callCount - 2]
+      assert.equal(IlpPacket.deserializeIlpPrepare(secondToLastCall).amount, '1675')
+      assert.equal(callCount, 5)
+    })
+
+    it('should approximate the MPS even if the connector does not return the receivedAmount and maximumAmount in the F08 reject data', async function () {
+      this.pluginA.maxAmount = 800
+      const spy = sinon.spy(this.pluginA, 'sendData')
+      const realSendData = this.pluginA.sendData
+      this.pluginA.sendData = async (data: Buffer) => {
+        let result = await realSendData.call(this.pluginA, data)
+        if (result[0] === IlpPacket.Type.TYPE_ILP_REJECT) {
+          result = IlpPacket.serializeIlpReject({
+            ...IlpPacket.deserializeIlpReject(result),
+            data: Buffer.alloc(0)
+          })
+        }
+        return result
+      }
+
+      this.clientSocket.setMinAndMaxBalance(-2000)
+      await this.clientSocket.stabilized()
+      assert.equal(spy.callCount, 5)
+    })
+
+    it('should send the whole amount in one chunk if it can', async function () {
+      this.pluginA.maxAmount = 100000
+      const spy = sinon.spy(this.pluginA, 'sendData')
+      this.clientSocket.setMinAndMaxBalance(-15000)
+      await this.clientSocket.stabilized()
+      assert.equal(spy.callCount, 1)
+    })
+  })
+
   describe('Error handling', function () {
     it('should emit an error and reject the stabilized Promise if it gets a reject with a final error code', async function () {
       const spy = sinon.spy()

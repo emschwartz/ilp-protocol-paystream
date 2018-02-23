@@ -11,6 +11,7 @@ const DEFAULT_STABILIZED_TIMEOUT = 60000
 const PROBE_AMOUNT = 1000
 const STARTING_RETRY_TIMEOUT = 100
 const RETRY_TIMEOUT_INCREASE_FACTOR = 2
+const AMOUNT_DECREASE_FACTOR = 0.5
 
 export interface PaymentSocketOpts {
   // TODO make sure this is a PluginV2
@@ -37,6 +38,7 @@ export class PaymentSocket extends EventEmitter {
   protected _minBalance: BigNumber
   protected _maxBalance: BigNumber
   protected maxPaymentSize: BigNumber
+  protected nextMaxAmount: BigNumber
   protected _totalSent: BigNumber
   protected _totalDelivered: BigNumber
   protected _exchangeRate: BigNumber
@@ -70,7 +72,8 @@ export class PaymentSocket extends EventEmitter {
     this._maxBalance = new BigNumber(Infinity)
     this.peerExpects = new BigNumber(0)
     this.peerWants = new BigNumber(Infinity)
-    this.maxPaymentSize = new BigNumber(1000) // this will be adjusted as we send chunks
+    this.maxPaymentSize = new BigNumber(Infinity) // this will be adjusted as we send chunks
+    this.nextMaxAmount = new BigNumber(Infinity) // this will be adjusted as we send chunks
     this._totalSent = new BigNumber(0)
     this._totalDelivered = new BigNumber(0)
     this.closed = false
@@ -140,7 +143,7 @@ export class PaymentSocket extends EventEmitter {
     this._minBalance = new BigNumber(amount)
 
     /* tslint:disable-next-line:no-floating-promises */
-    this.maybeSend()
+    this.startSending()
   }
 
   setMaxBalance (amount: BigNumber.Value): void {
@@ -151,7 +154,7 @@ export class PaymentSocket extends EventEmitter {
     this._maxBalance = new BigNumber(amount)
 
     /* tslint:disable-next-line:no-floating-promises */
-    this.maybeSend()
+    this.startSending()
   }
 
   setMinAndMaxBalance (amount: BigNumber.Value): void {
@@ -160,7 +163,7 @@ export class PaymentSocket extends EventEmitter {
     this._maxBalance = new BigNumber(amount)
 
     /* tslint:disable-next-line:no-floating-promises */
-    this.maybeSend()
+    this.startSending()
   }
 
   async connect (timeout = DEFAULT_STABILIZED_TIMEOUT): Promise<void> {
@@ -173,7 +176,7 @@ export class PaymentSocket extends EventEmitter {
     }
 
     /* tslint:disable-next-line:no-floating-promises */
-    this.maybeSend()
+    this.startSending()
 
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -314,7 +317,7 @@ export class PaymentSocket extends EventEmitter {
     this.debug(`accepted request with amount ${requestAmount}, balance is now: ${this._balance} (minBalance: ${this._minBalance}, maxBalance: ${this._maxBalance}, peerExpects: ${this.peerExpects}, peerWants: ${this.peerWants})`)
 
     if (this.peerExpects.isGreaterThan(0) && this._balance.isGreaterThan(this._minBalance)) {
-      return this.maybeSend()
+      return this.startSending()
     }
 
     // Check if the socket has stabilized (both sides are satisfied)
@@ -324,14 +327,7 @@ export class PaymentSocket extends EventEmitter {
     }
   }
 
-  protected async maybeSend (): Promise<void> {
-    // Start on the next tick of the event loop
-    // This ensures that if someone calls "await socket.stabilized" right after changing the limit
-    // the "stabilized" event will fire _after_ the listener has been added
-    await Promise.resolve()
-
-    let shouldContinue = true
-
+  protected async startSending (): Promise<void> {
     // Make sure we don't have two loops sending at the same time
     if (this.sending) {
       this.debug('already in the process of sending, not starting another send loop')
@@ -339,6 +335,22 @@ export class PaymentSocket extends EventEmitter {
     }
     this.sending = true
 
+    // Start on the next tick of the event loop
+    // This ensures that if someone calls "await socket.stabilized" right after changing the limit
+    // the "stabilized" event will fire _after_ the listener has been added
+    await Promise.resolve()
+
+    try {
+      await this.maybeSend()
+    } catch (err) {
+      this.debug('error while sending:', err)
+      this.emit('error', err)
+    }
+  }
+
+  protected async maybeSend (): Promise<void> {
+    let shouldContinue = true
+    this.sending = true
     this.debug(`maybeSend - balance: ${this._balance}, minBalance: ${this._minBalance}, maxBalance: ${this._maxBalance}, peerExpects: ${this.peerExpects}, peerWants: ${this.peerWants}`)
 
     // Wait until they've told us their address or close the socket if a timeout is reached
@@ -386,7 +398,7 @@ export class PaymentSocket extends EventEmitter {
     } else if (this._balance.isGreaterThan(this._maxBalance) && this.peerWants.isGreaterThan(0)) {
       // Send payment (because our balance is too high)
       sourceAmount = this._balance.minus(this._maxBalance)
-      sourceAmount = forceValueToBeBetween(sourceAmount, 0, this.maxPaymentSize)
+      sourceAmount = forceValueToBeBetween(sourceAmount, 0, this.nextMaxAmount)
 
       // Adjust how much we're sending to the receiver's maximum
       if (this._exchangeRate) {
@@ -397,8 +409,8 @@ export class PaymentSocket extends EventEmitter {
     } else if (this.peerExpects.isGreaterThan(0)) {
       // Peer is requesting payment, so pay until we've reached our minBalance
       // TODO adjust based on exchange rate and how much peer wants
-      sourceAmount = BigNumber.min(this._balance.minus(this._minBalance), this.maxPaymentSize)
-      sourceAmount = forceValueToBeBetween(sourceAmount, 0, this.maxPaymentSize)
+      sourceAmount = BigNumber.min(this._balance.minus(this._minBalance), this.nextMaxAmount)
+      sourceAmount = forceValueToBeBetween(sourceAmount, 0, this.nextMaxAmount)
 
       // Adjust how much we're sendign to the receiver's minimum
       if (this._exchangeRate) {
@@ -495,6 +507,38 @@ export class PaymentSocket extends EventEmitter {
       // This request succeeded to reset our retry-related variables
       this.consecutiveRejectedRequests = 0
       this.retryTimeout = STARTING_RETRY_TIMEOUT
+
+      // Adjust the chunk amount
+      if (this.maxPaymentSize.isFinite() && sourceAmount.isLessThan(this.maxPaymentSize)) {
+        this.nextMaxAmount = this.maxPaymentSize
+          .minus(sourceAmount)
+          .dividedBy(2)
+          .plus(sourceAmount)
+          .decimalPlaces(0, BigNumber.ROUND_DOWN)
+        this.debug(`setting the nextMaxAmount to ${this.nextMaxAmount} (path maximum payment size is at most: ${this.maxPaymentSize})`)
+      }
+    } else if (result.code === 'F08') {
+      // Amount too large
+
+      // Use the F08 error data to determine the path Maximum Payment Size
+      const reader = oer.Reader.from(result.unauthenticatedData)
+      try {
+        const receivedAmount = highLowToBigNumber(reader.readUInt64())
+        const maximumAmount = highLowToBigNumber(reader.readUInt64())
+
+        // If we got here without an error being thrown that means the connector
+        // did actually send those values back (thanks!)
+        const scalingFactor = maximumAmount.dividedBy(receivedAmount)
+        this.maxPaymentSize = sourceAmount.times(scalingFactor).decimalPlaces(0, BigNumber.ROUND_FLOOR)
+        this.nextMaxAmount = this.maxPaymentSize
+        this.debug(`maximum sourceAmount the path can support is at most: ${this.maxPaymentSize}`)
+      } catch (err) {
+        // The connector didn't set the receivedAmount and maximumAmount
+        // so we'll just try decreasing by some factor to try to discover the path MPS
+        this.maxPaymentSize = sourceAmount.minus(1)
+        this.nextMaxAmount = sourceAmount.times(AMOUNT_DECREASE_FACTOR).decimalPlaces(0, BigNumber.ROUND_DOWN)
+        this.debug(`connector did not include receivedAmount and maximumAmount in reject, decreasing nextMaxAmount to: ${this.nextMaxAmount}`)
+      }
     } else if (unfulfillableCondition) {
       // We sent an unfulfillable test payment so of course it was rejected
 
@@ -531,7 +575,6 @@ export class PaymentSocket extends EventEmitter {
 
     this.sending = false
     if (shouldContinue) {
-      this.debug('going to try sending again')
       return this.maybeSend()
     } else if (this.isStabilized()) {
       this.emit('stabilized')
@@ -543,7 +586,6 @@ export class PaymentSocket extends EventEmitter {
 
   protected parseChunkData (data: Buffer): void {
     if (data.length === 0) {
-      this.debug('peer did not send any data in packet')
       return
     }
 

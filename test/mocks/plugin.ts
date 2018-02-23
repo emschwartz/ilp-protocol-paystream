@@ -2,6 +2,7 @@ import { EventEmitter } from 'events'
 import * as IlpPacket from 'ilp-packet'
 import BigNumber from 'bignumber.js'
 import * as ILDCP from 'ilp-protocol-ildcp'
+import { Writer } from 'oer-utils'
 
 export interface DataHandler {
   (data: Buffer): Promise<Buffer>
@@ -19,6 +20,7 @@ export default class MockPlugin extends EventEmitter {
   public connected: boolean
   public mirror: MockPlugin
   protected identity: string
+  public maxAmount?: number
 
   constructor (exchangeRate: number, mirror?: MockPlugin) {
     super()
@@ -28,6 +30,7 @@ export default class MockPlugin extends EventEmitter {
     this.exchangeRate = exchangeRate
     this.mirror = mirror || new MockPlugin(1 / exchangeRate, this)
     this.identity = (mirror ? 'peerB' : 'peerA')
+    this.maxAmount = 1000
   }
 
   async connect () {
@@ -55,9 +58,21 @@ export default class MockPlugin extends EventEmitter {
           assetCode: 'ABC'
         })
       }
+      const amount = new BigNumber(parsed.amount)
+      if (this.maxAmount && amount.isGreaterThan(this.maxAmount)) {
+        const writer = new Writer()
+        writer.writeUInt64(amount.toNumber())
+        writer.writeUInt64(this.maxAmount)
+        return IlpPacket.serializeIlpReject({
+          code: 'F08',
+          message: 'Packet amount too large',
+          triggeredBy: 'test.connector',
+          data: writer.getBuffer()
+        })
+      }
       const newPacket = IlpPacket.serializeIlpPrepare({
         ...parsed,
-        amount: new BigNumber(parsed.amount).times(this.exchangeRate).toString(10)
+        amount: amount.times(this.exchangeRate).toString(10)
       })
       return this.mirror.dataHandler(newPacket)
     } else {
