@@ -335,24 +335,6 @@ export class PaymentSocket extends EventEmitter {
     }
     this.sending = true
 
-    // Start on the next tick of the event loop
-    // This ensures that if someone calls "await socket.stabilized" right after changing the limit
-    // the "stabilized" event will fire _after_ the listener has been added
-    await Promise.resolve()
-
-    try {
-      await this.maybeSend()
-    } catch (err) {
-      this.debug('error while sending:', err)
-      this.emit('error', err)
-    }
-  }
-
-  protected async maybeSend (): Promise<void> {
-    let shouldContinue = true
-    this.sending = true
-    this.debug(`maybeSend - balance: ${this._balance}, minBalance: ${this._minBalance}, maxBalance: ${this._maxBalance}, peerExpects: ${this.peerExpects}, peerWants: ${this.peerWants}`)
-
     // Wait until they've told us their address or close the socket if a timeout is reached
     if (!this.peerDestinationAccount) {
       this.debug('waiting for the other side to tell us their ILP address')
@@ -383,6 +365,25 @@ export class PaymentSocket extends EventEmitter {
       }
     }
 
+    // Start on the next tick of the event loop
+    // This ensures that if someone calls "await socket.stabilized" right after changing the limit
+    // the "stabilized" event will fire _after_ the listener has been added
+    await Promise.resolve()
+
+
+    try {
+      await this.maybeSend()
+    } catch (err) {
+      this.debug('error while sending:', err)
+      this.emit('error', err)
+    }
+  }
+
+  protected async maybeSend (): Promise<void> {
+    let shouldContinue = true
+    this.sending = true
+    this.debug(`maybeSend - balance: ${this._balance}, minBalance: ${this._minBalance}, maxBalance: ${this._maxBalance}, peerExpects: ${this.peerExpects}, peerWants: ${this.peerWants}`)
+
     // Determine if we're requesting money or pushing money
     // (A request for money is just a 0-amount packet that updates our min/max values)
     const amountExpected = this._minBalance.minus(this._balance)
@@ -412,7 +413,7 @@ export class PaymentSocket extends EventEmitter {
       sourceAmount = BigNumber.min(this._balance.minus(this._minBalance), this.nextMaxAmount)
       sourceAmount = forceValueToBeBetween(sourceAmount, 0, this.nextMaxAmount)
 
-      // Adjust how much we're sendign to the receiver's minimum
+      // Adjust how much we're sending to the receiver's minimum
       if (this._exchangeRate) {
         const sourceAmountReceiverExpects = this.peerExpects.dividedBy(this._exchangeRate).decimalPlaces(0, BigNumber.ROUND_CEIL)
         sourceAmount = BigNumber.min(sourceAmount, sourceAmountReceiverExpects)
@@ -466,7 +467,7 @@ export class PaymentSocket extends EventEmitter {
 
     // Send the chunk
     const result = await PSK2.sendRequest(this.plugin, {
-      destinationAccount: this.peerDestinationAccount,
+      destinationAccount: this.peerDestinationAccount!,
       sharedSecret: this._sharedSecret,
       sourceAmount: sourceAmount.toString(),
       data: serializeChunkData(chunkData),
