@@ -13,6 +13,10 @@ const STARTING_RETRY_TIMEOUT = 100
 const RETRY_TIMEOUT_INCREASE_FACTOR = 2
 const AMOUNT_DECREASE_FACTOR = 0.5
 
+const TYPE_CLOSE = 0
+const TYPE_CHUNK = 1
+const CLOSE_MESSAGE = Buffer.alloc(1, TYPE_CLOSE)
+
 export interface PaymentSocketOpts {
   // TODO make sure this is a PluginV2
   plugin: any,
@@ -204,11 +208,26 @@ export class PaymentSocket extends EventEmitter {
     }) as Promise<void>
   }
 
-  close () {
+  async close () {
     this.debug(`closing payment socket with destinationAccount: ${this._destinationAccount}`)
     this.closed = true
     this.connected = false
     this.emit('close')
+
+    if (!this.peerDestinationAccount) {
+      this.debug(`not sending close message to peer because we don't know their account`)
+      return
+    }
+
+    await PSK2.sendRequest(this.plugin, {
+      destinationAccount: this.peerDestinationAccount,
+      sharedSecret: this._sharedSecret,
+      sourceAmount: '0',
+      data: CLOSE_MESSAGE,
+      unfulfillableCondition: randomBytes(32),
+      requestId: this.requestId++
+    })
+    this.debug('sent close message to peer')
   }
 
   async stabilized (timeout = DEFAULT_STABILIZED_TIMEOUT): Promise<void> {
@@ -256,28 +275,33 @@ export class PaymentSocket extends EventEmitter {
   async handleRequest (request: PSK2.RequestHandlerParams): Promise<void> {
     if (this.closed) {
       this.debug('rejecting request because the socket is closed')
-      return request.reject()
+      return request.reject(CLOSE_MESSAGE)
     }
 
-    this.parseChunkData(request.data)
+    const closeChannel = this.parseChunkData(request.data)
+    if (closeChannel) {
+      this.debug('peer closed socket')
+      this.emit('close')
+      this.closed = true
+    }
 
     const requestAmount = new BigNumber(request.amount.toString())
 
+    // We've requested more money but they're not sending more
+    if (requestAmount.isEqualTo(0) && this._balance.isLessThan(this._minBalance)) {
+      this.debug(`requested money from other party but they aren't sending it. current balance: ${this._balance}, minBalance: ${this._minBalance}`)
+      // TODO is this always an error? What if we changed the limit between now and when the other side sent this request?
+      this.emit('error', new Error(`Requested money from other party but they aren't sending it. Current balance: ${this._balance}, expected: ${this._minBalance}`))
+    }
+
     if (!request.isFulfillable) {
       // TODO disconnect if we get too many of these
-      this.debug(`got unfulfillable request`)
+      this.debug(`rejecting unfulfillable request`)
       return request.reject(serializeChunkData({
         amountExpected: this._minBalance.minus(this._balance),
         amountWanted: this._maxBalance.minus(this._balance)
         // don't include destinationAccount or sharedSecret because the other side already knows it
       }))
-    }
-
-    // We've requested more money than the other side's minBalance allows them to send
-    if (requestAmount.isEqualTo(0) && this._balance.isLessThan(this._minBalance)) {
-      this.debug(`requested money from other party but they aren't sending it. current balance: ${this._balance}, minBalance: ${this._minBalance}`)
-      // TODO is this always an error? What if we changed the limit between now and when the other side sent this request?
-      this.emit('error', new Error(`Requested money from other party but they aren't sending it. Current balance: ${this._balance}, expected: ${this._minBalance}`))
     }
 
     // The other side has exceeded our maxBalance
@@ -369,7 +393,7 @@ export class PaymentSocket extends EventEmitter {
 
     // Start on the next tick of the event loop
     // This ensures that if someone calls "await socket.stabilized" right after changing the limit
-    // the "stabilized" event will fire _after_ the listener has been added
+    // the "stabilized" event will fire _after_ the listener has been added, even if the socket is stabilized when it starts
     await Promise.resolve()
 
     try {
@@ -441,7 +465,7 @@ export class PaymentSocket extends EventEmitter {
       return
     }
 
-    const chunkData: PaymentChunkData = {
+    const chunkData: SocketChunkData = {
       amountExpected: forceValueToBeBetween(amountExpected, 0, MAX_UINT64),
       amountWanted: forceValueToBeBetween(amountWanted, 0, MAX_UINT64)
     }
@@ -475,12 +499,14 @@ export class PaymentSocket extends EventEmitter {
       unfulfillableCondition,
       minDestinationAmount: minDestinationAmount.toString(),
       requestId: this.requestId++
-      // TODO set minDestinationAmount based on exchange rate
     })
     // we need to convert to string just because the BigNumber version used by PSK2 right now is incompatible with the one this module uses :/
     const destinationAmount = new BigNumber(result.destinationAmount.toString(10))
 
-    this.parseChunkData(result.data)
+    const closeSocket = this.parseChunkData(result.data)
+    if (closeSocket) {
+      shouldContinue = false
+    }
 
     // Determine exchange rate
     // Right now this will only be done on the first chunk and won't change from there
@@ -595,20 +621,32 @@ export class PaymentSocket extends EventEmitter {
     } else {
       this.debug('socket is not yet stabilized, but not continuing to send')
     }
+
+    if (closeSocket) {
+      this.debug('peer closed socket')
+      this.closed = true
+      this.emit('close')
+    }
   }
 
-  protected parseChunkData (data: Buffer): void {
+  protected parseChunkData (data: Buffer): boolean {
     if (data.length === 0) {
-      return
+      return false
     }
 
     try {
-      const chunkData = deserializeChunkData(data)
-      this.peerWants = chunkData.amountWanted
-      this.peerExpects = chunkData.amountExpected
-      this.peerDestinationAccount = chunkData.destinationAccount || this.peerDestinationAccount
+      const chunkData = deserializePacket(data)
+      if (isSocketChunkData(chunkData)) {
+        this.peerWants = chunkData.amountWanted
+        this.peerExpects = chunkData.amountExpected
+        this.peerDestinationAccount = chunkData.destinationAccount || this.peerDestinationAccount
+        return false
+      } else {
+        return true
+      }
     } catch (err) {
       this.debug('unable to parse chunk data from peer:', err)
+      return false
     }
   }
 }
@@ -681,20 +719,14 @@ export class PaymentServer {
     if (!request.keyId) {
       this.debug('rejecting request because it does not have a keyId so it was not created by a PaymentServer')
       // TODO send a better error message so the sender knows exactly what's going on
-      return request.reject(serializeChunkData({
-        amountWanted: new BigNumber(0),
-        amountExpected: new BigNumber(0)
-      }))
+      return request.reject(CLOSE_MESSAGE)
     }
 
     const socket = this.sockets.get(request.keyId.toString('hex'))
     if (!socket) {
       this.debug(`rejecting request for keyId: ${request.keyId.toString('hex')} because there is no open socket with that ID`)
       // TODO send a better error message so the sender knows exactly what's going on
-      return request.reject(serializeChunkData({
-        amountWanted: new BigNumber(0),
-        amountExpected: new BigNumber(0)
-      }))
+      return request.reject(CLOSE_MESSAGE)
     }
 
     return socket.handleRequest(request)
@@ -758,42 +790,62 @@ export async function createSocket (opts: CreateSocketOpts) {
   return socket
 }
 
-interface PaymentChunkData {
+interface SocketClose {
+}
+
+interface SocketChunkData {
   // TODO do we need to send all of these numbers?
   amountExpected: BigNumber,
   amountWanted: BigNumber,
   destinationAccount?: string
 }
 
-function forceValueToBeBetween (value: BigNumber.Value, min: BigNumber.Value, max: BigNumber.Value): BigNumber {
-  return BigNumber.min(BigNumber.max(value, min), max)
+function isSocketChunkData (packet: SocketClose | SocketChunkData): packet is SocketChunkData {
+  return packet.hasOwnProperty('amountExpected')
 }
 
-function serializeChunkData (chunkData: PaymentChunkData): Buffer {
+function serializeCloseMessage (): Buffer {
+  return Buffer.alloc(1, TYPE_CLOSE)
+}
+
+function serializeChunkData (chunkData: SocketChunkData): Buffer {
   const amountExpected = forceValueToBeBetween(chunkData.amountExpected, 0, MAX_UINT64)
   const amountWanted = forceValueToBeBetween(chunkData.amountWanted, 0, MAX_UINT64)
 
   const writer = new oer.Writer()
+  writer.writeUInt8(TYPE_CHUNK)
   writer.writeUInt64(bigNumberToHighLow(amountExpected))
   writer.writeUInt64(bigNumberToHighLow(amountWanted))
   writer.writeVarOctetString(Buffer.from(chunkData.destinationAccount || '', 'utf8'))
   return writer.getBuffer()
 }
 
-function deserializeChunkData (buffer: Buffer): PaymentChunkData {
+function deserializePacket (buffer: Buffer): SocketClose | SocketChunkData {
   const reader = oer.Reader.from(buffer)
-  const amountExpected = highLowToBigNumber(reader.readUInt64())
-  const amountWanted = highLowToBigNumber(reader.readUInt64())
-  let destinationAccount: string | undefined = reader.readVarOctetString().toString('utf8')
-  if (destinationAccount === '') {
-    destinationAccount = undefined
-  }
+  const packetType = reader.readUInt8()
 
-  return {
-    amountExpected,
-    amountWanted,
-    destinationAccount
+  if (packetType === TYPE_CLOSE) {
+    return {} as SocketClose
+  } else if (packetType === TYPE_CHUNK) {
+    const amountExpected = highLowToBigNumber(reader.readUInt64())
+    const amountWanted = highLowToBigNumber(reader.readUInt64())
+    let destinationAccount: string | undefined = reader.readVarOctetString().toString('utf8')
+    if (destinationAccount === '') {
+      destinationAccount = undefined
+    }
+
+    return {
+      amountExpected,
+      amountWanted,
+      destinationAccount
+    } as SocketChunkData
+  } else {
+    throw new Error(`Unknown packet type: ${packetType}`)
   }
+}
+
+function forceValueToBeBetween (value: BigNumber.Value, min: BigNumber.Value, max: BigNumber.Value): BigNumber {
+  return BigNumber.min(BigNumber.max(value, min), max)
 }
 
 // oer-utils returns [high, low], whereas Long expects low first

@@ -4,6 +4,7 @@ import { createSocket, createServer, PaymentServer, PaymentSocket } from '../src
 import MockPlugin from './mocks/plugin'
 import * as sinon from 'sinon'
 import * as IlpPacket from 'ilp-packet'
+import * as PSK2 from 'ilp-protocol-psk2'
 
 describe('PaymentSocket', function () {
   beforeEach(async function () {
@@ -95,6 +96,18 @@ describe('PaymentSocket', function () {
       assert.equal(this.serverSocket.isConnected(), true)
     })
 
+    it('should reject if the other side is closed', async function () {
+      await this.serverSocket.close()
+      let threw = false
+      try {
+        await this.clientSocket.connect()
+      } catch (err) {
+        threw = true
+      }
+
+      assert.equal(threw, true)
+    })
+
     it.skip('should timeout after the specified timeout', async function () {
 
     })
@@ -131,6 +144,26 @@ describe('PaymentSocket', function () {
       }
       assert(errored)
       clock.restore()
+    })
+
+    it('should close the other side if one side is closed', async function () {
+      const spy = sinon.spy()
+      this.serverSocket.on('close', spy)
+      await this.clientSocket.close()
+      assert.equal(spy.callCount, 1)
+    })
+
+    it('should reject the stabilized Promise if the other side closes before sending enough money', async function () {
+      this.clientSocket.setMinAndMaxBalance(2000)
+      setImmediate(() => this.serverSocket.close())
+
+      let errored = false
+      try {
+        await this.clientSocket.stabilized()
+      } catch (err) {
+        errored = true
+      }
+      assert.equal(errored, true)
     })
   })
 
@@ -289,7 +322,6 @@ describe('PaymentSocket', function () {
     })
 
     it('should allow the payer to request their money back if enabled', async function () {
-      this.clientSocket.close()
       const clientSocket = await createSocket({
         plugin: this.pluginA,
         destinationAccount: this.serverSocket.destinationAccount,
@@ -316,14 +348,8 @@ describe('PaymentSocket', function () {
     })
 
     it('should determine the exchange rate when the client socket is connected', async function () {
-      this.clientSocket.close()
-      const clientSocket = await createSocket({
-        plugin: this.pluginA,
-        destinationAccount: this.serverSocket.destinationAccount,
-        sharedSecret: this.serverSocket.sharedSecret
-      })
-      await clientSocket.connect()
-      assert.equal(clientSocket.getExchangeRate(), '0.5')
+      await this.clientSocket.connect()
+      assert.equal(this.clientSocket.getExchangeRate(), '0.5')
     })
 
     it('should determine the exchange rate when the server socket is connected', async function () {
@@ -351,7 +377,6 @@ describe('PaymentSocket', function () {
     })
 
     it('should allow the exchange rate to move by the specified slippage', async function () {
-      this.clientSocket.close()
       const clientSocket = await createSocket({
         plugin: this.pluginA,
         destinationAccount: this.serverSocket.destinationAccount,
@@ -575,6 +600,23 @@ describe('PaymentServer', function () {
       await this.server.connect()
       assert(spy.called)
     })
+
+    it('should reject packets for closed sockets', async function () {
+      await this.server.connect()
+      const serverSocket = this.server.createSocket()
+
+      await serverSocket.close()
+
+
+      const result = await PSK2.sendRequest(this.pluginA, {
+        destinationAccount: serverSocket.destinationAccount,
+        sharedSecret: serverSocket.sharedSecret,
+        sourceAmount: '0'
+      })
+
+      assert.equal(result.fulfilled, false)
+      assert.equal(result.data.toString('hex'), '00')
+    })
   })
 
   describe('disconnect', function () {
@@ -598,7 +640,6 @@ describe('PaymentServer', function () {
       await this.server.disconnect()
       assert.equal(closeSpy.callCount, 2)
     })
-
   })
 })
 
