@@ -804,10 +804,6 @@ function isSocketChunkData (packet: SocketClose | SocketChunkData): packet is So
   return packet.hasOwnProperty('amountExpected')
 }
 
-function serializeCloseMessage (): Buffer {
-  return Buffer.alloc(1, TYPE_CLOSE)
-}
-
 function serializeChunkData (chunkData: SocketChunkData): Buffer {
   const amountExpected = forceValueToBeBetween(chunkData.amountExpected, 0, MAX_UINT64)
   const amountWanted = forceValueToBeBetween(chunkData.amountWanted, 0, MAX_UINT64)
