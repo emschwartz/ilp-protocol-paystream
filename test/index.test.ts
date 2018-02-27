@@ -32,6 +32,12 @@ describe('PaymentSocket', function () {
       assert.throws(() => this.clientSocket.sharedSecret = Buffer.alloc(0))
     })
 
+    it('should export the sharedSecret with the prefix "payment-socket:"', function () {
+      const prefix = 'payment-socket:'
+      assert.equal(this.clientSocket.sharedSecret.slice(0, Buffer.from(prefix, 'utf8').length).toString('utf8'), prefix)
+      assert.equal(this.serverSocket.sharedSecret.slice(0, Buffer.from(prefix, 'utf8').length).toString('utf8'), prefix)
+    })
+
     it('should export the balance as a string but not allow it to be modified', function () {
       assert.typeOf(this.clientSocket.balance, 'string')
       assert.throws(() => this.clientSocket.balance = '10')
@@ -114,6 +120,16 @@ describe('PaymentSocket', function () {
 
     it.skip('should timeout after 60 seconds by default', async function () {
 
+    })
+
+    it('should reject packets that are not from other Payment Sockets', async function () {
+      const result = await PSK2.sendRequest(this.pluginA, {
+        destinationAccount: this.serverSocket.destinationAccount,
+        sharedSecret: this.serverSocket.sharedSecret,
+        sourceAmount: '10'
+      })
+
+      assert.equal(result.fulfilled, false)
     })
   })
 
@@ -552,7 +568,6 @@ describe('PaymentSocket', function () {
       })
       clock = sinon.useFakeTimers()
 
-      this.clientSocket.close()
       const clientSocket = await createSocket({
         plugin: this.pluginA,
         destinationAccount: this.serverSocket.destinationAccount,
@@ -601,21 +616,24 @@ describe('PaymentServer', function () {
       assert(spy.called)
     })
 
-    it('should reject packets for closed sockets', async function () {
+    it('should reject connections for sockets that have been closed', async function () {
       await this.server.connect()
       const serverSocket = this.server.createSocket()
 
       await serverSocket.close()
 
+      let errored = false
+      try {
+        await createSocket({
+          plugin: this.pluginA,
+          sharedSecret: serverSocket.sharedSecret,
+          destinationAccount: serverSocket.destinationAccount
+        })
+      } catch (err) {
+        errored = true
+      }
 
-      const result = await PSK2.sendRequest(this.pluginA, {
-        destinationAccount: serverSocket.destinationAccount,
-        sharedSecret: serverSocket.sharedSecret,
-        sourceAmount: '0'
-      })
-
-      assert.equal(result.fulfilled, false)
-      assert.equal(result.data.toString('hex'), '00')
+      assert.equal(errored, true)
     })
   })
 
@@ -641,17 +659,29 @@ describe('PaymentServer', function () {
       assert.equal(closeSpy.callCount, 2)
     })
   })
+
+  describe('createSocket', function () {
+    beforeEach(async function () {
+      await this.server.connect()
+    })
+
+    it('should prepend the string "payment-socket:" to the shared secret', async function () {
+      const prefix = 'payment-socket:'
+      const { sharedSecret } = await this.server.createSocket()
+      assert.equal(sharedSecret.slice(0, Buffer.from(prefix, 'utf8').length).toString('utf8'), prefix)
+    })
+  })
 })
 
 describe('Client Socket (createSocket)', function () {
   beforeEach(async function () {
     this.pluginA = new MockPlugin(0.5)
     this.pluginB = this.pluginA.mirror
-    this.server = await createServer({ plugin: this.pluginB })
   })
 
   it('should use the same sharedSecret as the server', async function () {
-    const { destinationAccount, sharedSecret } = this.server.createSocket()
+    const server = await createServer({ plugin: this.pluginB })
+    const { destinationAccount, sharedSecret } = server.createSocket()
 
     const clientSocket = await createSocket({
       plugin: this.pluginA,
@@ -660,5 +690,26 @@ describe('Client Socket (createSocket)', function () {
     })
 
     assert.deepEqual(sharedSecret, clientSocket.sharedSecret)
+  })
+
+  it('should reject if it is given the details for an incompatible PSK2 receiver (not a Payment Socket Server)', async function () {
+    const receiver = await PSK2.createReceiver({
+      plugin: this.pluginB,
+      requestHandler: (params: PSK2.RequestHandlerParams) => params.accept()
+    })
+    const { destinationAccount, sharedSecret } = receiver.generateAddressAndSecret()
+
+    let errored = false
+    try {
+      await createSocket({
+        plugin: this.pluginA,
+        destinationAccount,
+        sharedSecret
+      })
+    } catch (err) {
+      errored = true
+    }
+
+    assert.equal(errored, true)
   })
 })

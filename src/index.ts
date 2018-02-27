@@ -16,6 +16,7 @@ const AMOUNT_DECREASE_FACTOR = 0.5
 const TYPE_CLOSE = 0
 const TYPE_CHUNK = 1
 const CLOSE_MESSAGE = Buffer.alloc(1, TYPE_CLOSE)
+export const SHARED_SECRET_PREFIX = Buffer.from('payment-socket:', 'utf8')
 
 export interface PaymentSocketOpts {
   // TODO make sure this is a PluginV2
@@ -34,6 +35,7 @@ export interface PaymentSocketOpts {
 export class PaymentSocket extends EventEmitter {
   protected _destinationAccount: string
   protected _sharedSecret: Buffer
+  protected sharedSecretWithPrefix: Buffer
   protected plugin: any
   protected peerDestinationAccount?: string
   protected peerWants: BigNumber
@@ -67,7 +69,11 @@ export class PaymentSocket extends EventEmitter {
 
     this.plugin = opts.plugin
     this._destinationAccount = opts.destinationAccount
-    this._sharedSecret = opts.sharedSecret
+    if (!SHARED_SECRET_PREFIX.equals(opts.sharedSecret.slice(0, SHARED_SECRET_PREFIX.length))) {
+      throw new Error('Shared secret and destination account are not for a Payment Socket (must start with "payment-socket:")')
+    }
+    this.sharedSecretWithPrefix = opts.sharedSecret
+    this._sharedSecret = opts.sharedSecret.slice(SHARED_SECRET_PREFIX.length)
     this.peerDestinationAccount = opts.peerDestinationAccount
     this.socketTimeout = opts.timeout || 60000
 
@@ -98,7 +104,7 @@ export class PaymentSocket extends EventEmitter {
   }
 
   get sharedSecret (): Buffer {
-    return this._sharedSecret
+    return this.sharedSecretWithPrefix
   }
 
   get balance (): string {
@@ -195,15 +201,21 @@ export class PaymentSocket extends EventEmitter {
         cleanup.call(this)
         resolve()
       }
+      const closeListener = () => {
+        cleanup.call(this)
+        reject(new Error('Peer closed connection'))
+      }
 
       function cleanup () {
         clearTimeout(timer)
         this.removeListener('error', errorListener)
         this.removeListener('connect', connectListener)
+        this.removeListener('close', closeListener)
       }
 
       this.once('error', errorListener)
       this.once('connect', connectListener)
+      this.once('close', closeListener)
       /* tslint:disable-next-line:no-unnecessary-type-assertion */
     }) as Promise<void>
   }
@@ -512,7 +524,7 @@ export class PaymentSocket extends EventEmitter {
     // Right now this will only be done on the first chunk and won't change from there
     // TODO should the exchange rate be allowed to change with each chunk?
     // (we need to make sure connectors can't just make each chunk progressively worse by the slippage amount)
-    if (!this._exchangeRate && destinationAmount.isGreaterThan(0)) {
+    if (!closeSocket && !this._exchangeRate && destinationAmount.isGreaterThan(0)) {
       this._exchangeRate = destinationAmount.dividedBy(sourceAmount)
       this.debug(`determined exchange rate to be: ${this._exchangeRate}`)
 
@@ -686,7 +698,7 @@ export class PaymentServer {
     this.debug('disconnecting receiver and closing all sockets')
     await this.receiver.disconnect()
     for (let socket of this.sockets.values()) {
-      socket.close()
+      await socket.close()
     }
     this.debug('disconnected')
   }
@@ -703,7 +715,7 @@ export class PaymentServer {
       ...opts,
       plugin: this.plugin,
       destinationAccount,
-      sharedSecret,
+      sharedSecret: Buffer.concat([SHARED_SECRET_PREFIX, sharedSecret]),
       identity: 'sever',
       slippage: (opts.slippage !== undefined ? new BigNumber(opts.slippage) : undefined)
     })
@@ -756,7 +768,8 @@ export async function createSocket (opts: CreateSocketOpts) {
   const receiver = await PSK2.createReceiver({
     plugin: opts.plugin
   })
-  const { destinationAccount } = receiver.registerRequestHandlerForSecret(opts.sharedSecret, (request: PSK2.RequestHandlerParams) => {
+  const sharedSecretWithoutPrefix = opts.sharedSecret.slice(SHARED_SECRET_PREFIX.length)
+  const { destinationAccount } = receiver.registerRequestHandlerForSecret(sharedSecretWithoutPrefix, (request: PSK2.RequestHandlerParams) => {
     return socket.handleRequest(request)
   })
   socket = new PaymentSocket({
