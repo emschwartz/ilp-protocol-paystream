@@ -5,6 +5,7 @@ import MockPlugin from './mocks/plugin'
 import * as sinon from 'sinon'
 import * as IlpPacket from 'ilp-packet'
 import * as PSK2 from 'ilp-protocol-psk2'
+import * as lolex from 'lolex'
 
 describe('PaymentSocket', function () {
   beforeEach(async function () {
@@ -208,6 +209,103 @@ describe('PaymentSocket', function () {
     })
   })
 
+  describe('pay', function () {
+    it('should lower the maximum balance and resolve when the balance is below the maximum', async function () {
+      await this.clientSocket.pay(2000)
+      assert.equal(this.clientSocket.balance, '-2000')
+
+      await this.clientSocket.pay(1500)
+      assert.equal(this.clientSocket.balance, '-3500')
+    })
+
+    it('should reject if the amount is higher than the other party will accept', async function () {
+      this.serverSocket.setMaxBalance(900)
+      let errored = false
+      try {
+        await this.clientSocket.pay(2000)
+      } catch (err) {
+        errored = true
+      }
+      assert.equal(errored, true)
+    })
+
+    it('should resolve when the socket has stabilized, even if the user changed the limits before it did', async function () {
+      const payPromise = this.clientSocket.pay(2000)
+      this.clientSocket.setMaxBalance(-1000)
+
+      await payPromise
+
+      assert.equal(this.clientSocket.balance, '-1000')
+    })
+  })
+
+  describe('charge', function () {
+    it('should raise the minimum balance and resolve when the balance is above the minimum', async function () {
+      this.serverSocket.setMinBalance(-5000)
+
+      await this.clientSocket.charge(2000)
+      assert.equal(this.clientSocket.balance, '2000')
+    })
+
+    it('should raise the minimum balance further and resolve when the balance is above the new minimum if it starts above zero', async function () {
+      this.serverSocket.setMinBalance(-5000)
+
+      await this.clientSocket.charge(2000)
+      assert.equal(this.clientSocket.balance, '2000')
+
+      await this.clientSocket.charge(1500)
+      assert.equal(this.clientSocket.balance, '3500')
+    })
+
+    it('should reject if the amount is higher than the other party is willing to pay', async function () {
+      // use lolex directly until https://github.com/DefinitelyTyped/DefinitelyTyped/pull/23694 is merged
+      const clock = lolex.install({
+        toFake: ['setTimeout']
+      })
+
+      const notStabilized = this.clientSocket.charge(2000)
+      clock.runAll()
+      let errored = false
+      try {
+        await notStabilized
+      } catch (err) {
+        errored = true
+      }
+      assert(errored)
+      clock.uninstall()
+    })
+
+    it('should resolve when the socket has stabilized, even if the user changed the limits before it did', async function () {
+      this.serverSocket.setMinBalance(-5000)
+
+      const chargePromise = this.clientSocket.charge(2000)
+      this.clientSocket.setMinBalance(1000)
+
+      await chargePromise
+
+      assert.equal(this.clientSocket.balance, '1000')
+    })
+  })
+
+  describe('payUpTo', function () {
+    it('should lower the min balance by the specified amount', async function () {
+      this.clientSocket.payUpTo(1000)
+      assert.equal(this.clientSocket.minBalance, '-1000')
+
+      this.clientSocket.payUpTo(1500)
+      assert.equal(this.clientSocket.minBalance, '-2500')
+    })
+  })
+
+  describe('chargeUpTo', function () {
+    it('should raise the max balance by the specified amount', async function () {
+      this.serverSocket.chargeUpTo(1000)
+      assert.equal(this.serverSocket.maxBalance, '1000')
+
+      this.serverSocket.chargeUpTo(1500)
+      assert.equal(this.serverSocket.maxBalance, '2500')
+    })
+  })
 
   describe('Events', function () {
     it('should emit "chunk" on every incoming or outgoing request', async function () {
@@ -272,6 +370,7 @@ describe('PaymentSocket', function () {
       this.serverSocket.setMinAndMaxBalance(2000)
       await this.clientSocket.stabilized()
 
+      await this.serverSocket.stabilized()
       assert.equal(this.serverSocket.balance, '2000')
     })
 
@@ -318,14 +417,17 @@ describe('PaymentSocket', function () {
 
   describe('Refunds', function () {
     it('should be disabled by default', async function () {
-      const clock = sinon.useFakeTimers()
+      // use lolex directly until https://github.com/DefinitelyTyped/DefinitelyTyped/pull/23694 is merged
+      const clock = lolex.install({
+        toFake: ['setTimeout']
+      })
 
       this.clientSocket.setMinAndMaxBalance(-1000)
       await this.clientSocket.stabilized()
       this.clientSocket.setMinAndMaxBalance(0)
 
       const notStabilized = this.clientSocket.stabilized()
-      clock.tick(100000)
+      clock.runAll()
       let errored = false
       try {
         await notStabilized
@@ -334,7 +436,7 @@ describe('PaymentSocket', function () {
       }
       assert(errored)
       assert.equal(this.serverSocket.balance, '500')
-      clock.restore()
+      clock.uninstall()
     })
 
     it('should allow the payer to request their money back if enabled', async function () {
