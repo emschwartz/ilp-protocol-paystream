@@ -34,38 +34,46 @@ export interface PaymentSocketOpts {
 }
 
 export class PaymentSocket extends EventEmitter {
+  // Configuration
   protected _destinationAccount: string
   protected _sharedSecret: Buffer
   protected sharedSecretWithPrefix: Buffer
   protected plugin: any
   protected peerDestinationAccount?: string
+  protected debug: Debug.IDebugger
+  protected socketTimeout: number
+  protected enableRefunds: boolean
+  protected slippage: BigNumber
+
+  // Balance and Limits
+  protected _balance: BigNumber
   protected peerWants: BigNumber
   protected peerExpects: BigNumber
-  protected _balance: BigNumber
   protected _minBalance: BigNumber
   protected _maxBalance: BigNumber
+
+  // Path Maximum
   protected maxPaymentSize: BigNumber
   protected nextMaxAmount: BigNumber
+
+  // Stats
   protected _totalSent: BigNumber
   protected _totalDelivered: BigNumber
   protected _exchangeRate: BigNumber
-  protected debug: Debug.IDebugger
+  protected numIncomingChunksFulfilled: number
+  protected numIncomingChunksRejected: number
+  protected numOutgoingChunksFulfilled: number
+  protected numOutgoingChunksRejected: number
+
+  // Status
   protected closed: boolean
   protected sending: boolean
-  protected socketTimeout: number
-  protected sendAddress: boolean
-  protected enableRefunds: boolean
-  protected slippage: BigNumber
+  protected shouldSendAddressToPeer: boolean
   protected connected: boolean
   protected consecutiveRejectedRequests: number
   protected maxRetries: number
   protected retryTimeout: number
   protected requestId: number
-  protected numIncomingChunksFulfilled: number
-  protected numIncomingChunksRejected: number
-  protected numOutgoingChunksFulfilled: number
-  protected numOutgoingChunksRejected: number
-  // TODO expose the number of chunks sent/received or fulfilled/rejected?
 
   constructor (opts: PaymentSocketOpts) {
     super()
@@ -81,6 +89,10 @@ export class PaymentSocket extends EventEmitter {
     this._sharedSecret = opts.sharedSecret.slice(SHARED_SECRET_PREFIX.length)
     this.peerDestinationAccount = opts.peerDestinationAccount
     this.socketTimeout = opts.timeout || 60000
+    this.enableRefunds = !!opts.enableRefunds
+    this.slippage = opts.slippage || new BigNumber(0.01)
+    this.shouldSendAddressToPeer = !!opts.sendAddress
+    this.maxRetries = (typeof opts.maxRetries === 'number' ? opts.maxRetries : 5)
 
     this._balance = new BigNumber(0)
     this._minBalance = new BigNumber(0)
@@ -97,12 +109,8 @@ export class PaymentSocket extends EventEmitter {
     this.numOutgoingChunksRejected = 0
     this.closed = false
     this.sending = false
-    this.sendAddress = !!opts.sendAddress
-    this.enableRefunds = !!opts.enableRefunds
-    this.slippage = opts.slippage || new BigNumber(0.01)
     this.connected = false
     this.consecutiveRejectedRequests = 0
-    this.maxRetries = (typeof opts.maxRetries === 'number' ? opts.maxRetries : 5)
     this.retryTimeout = STARTING_RETRY_TIMEOUT
     this.requestId = 0
     this.debug(`new socket created with minBalance ${this._minBalance}, maxBalance ${this._maxBalance}, slippage: ${this.slippage}, and refunds ${this.enableRefunds ? 'enabled' : 'disabled'}`)
@@ -525,14 +533,12 @@ export class PaymentSocket extends EventEmitter {
 
     // Determine if we're requesting money or pushing money
     // (A request for money is just a 0-amount packet that updates our min/max values)
-    const amountExpected = this._minBalance.minus(this._balance)
-    const amountWanted = this._maxBalance.minus(this._balance)
     let unfulfillableCondition: Buffer | undefined = undefined
     let sourceAmount
     if (this._balance.isLessThan(this._minBalance)) {
       // Request payment
       sourceAmount = new BigNumber(0)
-      this.debug(`requesting ${amountExpected} from peer`)
+      this.debug(`requesting payment from peer`)
       // Don't keep looping because we're just going to send one request for money and then wait to get paid
       shouldContinue = false
     } else if (this._balance.isGreaterThan(this._maxBalance) && this.peerWants.isGreaterThan(0)) {
@@ -563,7 +569,7 @@ export class PaymentSocket extends EventEmitter {
         shouldContinue = false
       }
       this.debug(`sending ${sourceAmount} because peer requested payment`)
-    } else if (this.sendAddress || !this._exchangeRate) {
+    } else if (this.shouldSendAddressToPeer || !this._exchangeRate) {
       // Send a dummy request just to tell the other side our details and determine the exchange rate
       // TODO the initialization call should just be separate from this flow
       sourceAmount = new BigNumber(PROBE_AMOUNT)
@@ -580,16 +586,6 @@ export class PaymentSocket extends EventEmitter {
         this.emit('error', new Error(`Stopped outside of the balance window. Current balance is: ${this._balance}, minBalance: ${this._minBalance}, maxBalance: ${this._maxBalance}`))
       }
       return
-    }
-
-    const chunkData: SocketChunkData = {
-      amountExpected: forceValueToBeBetween(amountExpected, 0, MAX_UINT64),
-      amountWanted: forceValueToBeBetween(amountWanted, 0, MAX_UINT64)
-    }
-    this.debug(`telling peer we expect: ${chunkData.amountExpected} and want: ${chunkData.amountWanted}`)
-    if (this.sendAddress) {
-      chunkData.destinationAccount = this._destinationAccount
-      this.sendAddress = false
     }
 
     // Use the exchange rate to determine the minDestinationAmount the receiver should accept for this chunk
@@ -611,16 +607,26 @@ export class PaymentSocket extends EventEmitter {
 
     // Send the chunk
     const requestId = this.requestId++
-    this.debug(`sending request ${requestId}`)
+    const amountExpected = forceValueToBeBetween(this._minBalance.minus(this._balance), 0, MAX_UINT64)
+    const amountWanted = forceValueToBeBetween(this._maxBalance.minus(this._balance), 0, MAX_UINT64)
+    this.debug(`sending request ${requestId} and telling our peer we expect: ${amountExpected} and want: ${amountWanted}`)
     const result = await PSK2.sendRequest(this.plugin, {
       destinationAccount: this.peerDestinationAccount!,
       sharedSecret: this._sharedSecret,
       sourceAmount: sourceAmount.toString(),
-      data: serializeChunkData(chunkData),
+      data: serializeChunkData({
+        amountExpected,
+        amountWanted,
+        destinationAccount: (this.shouldSendAddressToPeer ? this._destinationAccount : undefined)
+      }),
       unfulfillableCondition,
       minDestinationAmount: minDestinationAmount.toString(),
       requestId
     })
+
+    // TODO what if our message doesn't get through?
+    this.shouldSendAddressToPeer = false
+
     // we need to convert to string just because the BigNumber version used by PSK2 right now is incompatible with the one this module uses :/
     const destinationAmount = new BigNumber(result.destinationAmount.toString(10))
 
