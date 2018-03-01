@@ -590,39 +590,45 @@ describe('PaymentSocket', function () {
       assert.equal(spy.callCount, 1)
     })
 
-    it('should retry on temporary errors up to the specified maxRetries and then emit an error', async function () {
-      let clock: sinon.SinonFakeTimers
-      const interval = setInterval(() => {
-        if (clock) {
-          clock.tick(1000)
-        }
+    it('should retry on temporary errors', async function () {
+      const clock = lolex.install({
+        toFake: ['setTimeout']
       })
-      clock = sinon.useFakeTimers()
-
-      const clientSocket = await createSocket({
-        plugin: this.pluginA,
-        destinationAccount: this.serverSocket.destinationAccount,
-        sharedSecret: this.serverSocket.sharedSecret,
-        maxRetries: 7
-      })
+      const interval = setInterval(() => clock.tick(1000))
 
       const spy = sinon.spy()
-      clientSocket.on('error', spy)
+      this.clientSocket.on('error', spy)
 
       const sendDataStub = sinon.stub(this.pluginA, 'sendData')
+        .onCall(0)
         .resolves(IlpPacket.serializeIlpReject({
           code: 'T00',
           message: 'Internal Server Error',
           data: Buffer.alloc(0),
           triggeredBy: 'test.connector'
         }))
+        .onCall(1)
+        .resolves(IlpPacket.serializeIlpReject({
+          code: 'T01',
+          message: 'Peer Unreachable',
+          data: Buffer.alloc(0),
+          triggeredBy: 'test.connector'
+        }))
+        .onCall(2)
+        .resolves(IlpPacket.serializeIlpReject({
+          code: 'T76',
+          message: 'Some Other Temporary Error',
+          data: Buffer.alloc(0),
+          triggeredBy: 'test.connector'
+        }))
+        .callThrough()
 
-      clientSocket.setMinAndMaxBalance(-1000)
-      await assert.isRejected(clientSocket.stabilized(), 'Sending chunk failed with code: T00 and message: Internal Server Error. Retried 7 times but each was rejected')
+      this.clientSocket.setMinAndMaxBalance(-1000)
+      await this.clientSocket.stabilized()
 
-      assert.equal(sendDataStub.callCount, 7)
-      assert.equal(spy.callCount, 1)
-      clock.restore()
+      assert.equal(sendDataStub.callCount, 4)
+      assert.equal(spy.callCount, 0)
+      clock.uninstall()
       clearInterval(interval)
     })
 

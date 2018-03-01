@@ -30,7 +30,6 @@ export interface PaymentSocketOpts {
   enableRefunds?: boolean,
   identity?: string,
   slippage?: BigNumber.Value,
-  maxRetries?: number,
   minBalance?: BigNumber.Value,
   maxBalance?: BigNumber.Value
 }
@@ -73,7 +72,6 @@ export class PaymentSocket extends EventEmitter {
   protected shouldSendAddressToPeer: boolean
   protected connected: boolean
   protected consecutiveRejectedRequests: number
-  protected maxRetries: number
   protected retryTimeout: number
   protected requestId: number
 
@@ -94,7 +92,6 @@ export class PaymentSocket extends EventEmitter {
     this.enableRefunds = !!opts.enableRefunds
     this.slippage = (opts.slippage !== undefined ? new BigNumber(opts.slippage) : new BigNumber(0.01))
     this.shouldSendAddressToPeer = !!opts.sendAddress
-    this.maxRetries = (typeof opts.maxRetries === 'number' ? opts.maxRetries : 5)
 
     this._balance = new BigNumber(0)
     this._minBalance = new BigNumber(opts.minBalance || 0)
@@ -729,15 +726,9 @@ export class PaymentSocket extends EventEmitter {
         // Retry on temporary rejection codes
 
         this.consecutiveRejectedRequests += 1
-        if (this.consecutiveRejectedRequests < this.maxRetries) {
-          this.debug(`got temporary error code: ${result.code}, message: ${result.message}. waiting ${this.retryTimeout}ms before retrying`)
-          await new Promise((resolve, reject) => setTimeout(resolve, this.retryTimeout))
-          this.retryTimeout = this.retryTimeout * RETRY_TIMEOUT_INCREASE_FACTOR
-        } else {
-          this.debug(`packet was rejected ${this.consecutiveRejectedRequests} times in a row, not retrying anymore`)
-          this.emit('error', new Error(`Sending chunk failed with code: ${result.code} and message: ${result.message}. Retried ${this.consecutiveRejectedRequests} times but each was rejected`))
-          shouldContinue = false
-        }
+        this.debug(`got temporary error code: ${result.code}, message: ${result.message}. waiting ${this.retryTimeout}ms before retrying`)
+        await new Promise((resolve, reject) => setTimeout(resolve, this.retryTimeout))
+        this.retryTimeout = this.retryTimeout * RETRY_TIMEOUT_INCREASE_FACTOR
       } else {
         // Unexpected error
 
@@ -798,7 +789,6 @@ export class PaymentSocket extends EventEmitter {
 export interface ServerCreateSocketOpts {
   enableRefunds?: boolean,
   slippage?: BigNumber.Value,
-  maxRetries?: number,
   maxBalance?: BigNumber.Value,
   minBalance?: BigNumber.Value
 }
@@ -892,8 +882,7 @@ export interface CreateSocketOpts {
   minBalance?: BigNumber.Value,
   maxBalance?: BigNumber.Value,
   enableRefunds?: boolean,
-  slippage?: BigNumber.Value,
-  maxRetries?: number
+  slippage?: BigNumber.Value
 }
 
 export async function createSocket (opts: CreateSocketOpts) {
@@ -914,8 +903,7 @@ export async function createSocket (opts: CreateSocketOpts) {
     sendAddress: true,
     enableRefunds: opts.enableRefunds,
     identity: 'client',
-    slippage: (opts.slippage !== undefined ? new BigNumber(opts.slippage) : undefined),
-    maxRetries: opts.maxRetries
+    slippage: (opts.slippage !== undefined ? new BigNumber(opts.slippage) : undefined)
   })
   if (opts.minBalance !== undefined) {
     socket.setMinBalance(opts.minBalance)
