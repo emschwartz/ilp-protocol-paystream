@@ -29,8 +29,10 @@ export interface PaymentSocketOpts {
   sendAddress?: boolean,
   enableRefunds?: boolean,
   identity?: string,
-  slippage?: BigNumber,
-  maxRetries?: number
+  slippage?: BigNumber.Value,
+  maxRetries?: number,
+  minBalance?: BigNumber.Value,
+  maxBalance?: BigNumber.Value
 }
 
 export class PaymentSocket extends EventEmitter {
@@ -90,15 +92,15 @@ export class PaymentSocket extends EventEmitter {
     this.peerDestinationAccount = opts.peerDestinationAccount
     this.socketTimeout = opts.timeout || 60000
     this.enableRefunds = !!opts.enableRefunds
-    this.slippage = opts.slippage || new BigNumber(0.01)
+    this.slippage = (opts.slippage !== undefined ? new BigNumber(opts.slippage) : new BigNumber(0.01))
     this.shouldSendAddressToPeer = !!opts.sendAddress
     this.maxRetries = (typeof opts.maxRetries === 'number' ? opts.maxRetries : 5)
 
     this._balance = new BigNumber(0)
-    this._minBalance = new BigNumber(0)
-    this._maxBalance = new BigNumber(Infinity)
+    this._minBalance = new BigNumber(opts.minBalance || 0)
+    this._maxBalance = new BigNumber(opts.maxBalance || 0)
     this.peerExpects = new BigNumber(0)
-    this.peerWants = new BigNumber(Infinity)
+    this.peerWants = new BigNumber(Infinity) // assume they want to get paid until they tell us otherwise
     this.maxPaymentSize = new BigNumber(Infinity) // this will be adjusted as we send chunks
     this.nextMaxAmount = new BigNumber(Infinity) // this will be adjusted as we send chunks
     this._totalSent = new BigNumber(0)
@@ -796,7 +798,9 @@ export class PaymentSocket extends EventEmitter {
 export interface ServerCreateSocketOpts {
   enableRefunds?: boolean,
   slippage?: BigNumber.Value,
-  maxRetries?: number
+  maxRetries?: number,
+  maxBalance?: BigNumber.Value,
+  minBalance?: BigNumber.Value
 }
 
 export interface PaymentServerOpts {

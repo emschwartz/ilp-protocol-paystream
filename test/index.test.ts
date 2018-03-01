@@ -19,12 +19,15 @@ describe('PaymentSocket', function () {
       plugin: this.pluginB,
       secret: Buffer.alloc(32)
     })
-    this.serverSocket = this.server.createSocket()
+    this.serverSocket = this.server.createSocket({
+      maxBalance: Infinity
+    })
 
     this.clientSocket = await createSocket({
       plugin: this.pluginA,
       destinationAccount: this.serverSocket.destinationAccount,
-      sharedSecret: this.serverSocket.sharedSecret
+      sharedSecret: this.serverSocket.sharedSecret,
+      maxBalance: Infinity
     })
   })
 
@@ -388,7 +391,8 @@ describe('PaymentSocket', function () {
         plugin: this.pluginA,
         destinationAccount: this.serverSocket.destinationAccount,
         sharedSecret: this.serverSocket.sharedSecret,
-        enableRefunds: true
+        enableRefunds: true,
+        maxBalance: Infinity
       })
 
       // Server is paying client
@@ -687,6 +691,12 @@ describe('PaymentServer', function () {
       const { sharedSecret } = await this.server.createSocket()
       assert.equal(sharedSecret.slice(0, Buffer.from(prefix, 'utf8').length).toString('utf8'), prefix)
     })
+
+    it('should default to minBalance and maxBalance of 0', async function () {
+      const socket = await this.server.createSocket()
+      assert.equal(socket.minBalance, '0')
+      assert.equal(socket.maxBalance, '0')
+    })
   })
 })
 
@@ -707,6 +717,20 @@ describe('Client Socket (createSocket)', function () {
     })
 
     assert.deepEqual(sharedSecret, clientSocket.sharedSecret)
+  })
+
+  it('should default to minBalance and maxBalance of 0', async function () {
+    const server = await createServer({ plugin: this.pluginB })
+    const { destinationAccount, sharedSecret } = server.createSocket()
+
+    const clientSocket = await createSocket({
+      plugin: this.pluginA,
+      destinationAccount,
+      sharedSecret
+    })
+
+    assert.equal(clientSocket.minBalance, '0')
+    assert.equal(clientSocket.maxBalance, '0')
   })
 
   it('should reject if it is given the details for an incompatible PSK2 receiver (not a Payment Socket Server)', async function () {
