@@ -162,7 +162,7 @@ export class PaymentSocket extends EventEmitter {
 
   setMinBalance (amount: BigNumber.Value): void {
     if (this._maxBalance.isLessThan(amount)) {
-      throw new Error(`Cannot set minBalance lower than maxBalance (${this._maxBalance})`)
+      throw new Error(`Cannot set minBalance greater than maxBalance (${this._maxBalance})`)
     }
     this.debug(`setting minBalance to ${amount}`)
     this._minBalance = new BigNumber(amount)
@@ -173,7 +173,7 @@ export class PaymentSocket extends EventEmitter {
 
   setMaxBalance (amount: BigNumber.Value): void {
     if (this._minBalance.isGreaterThan(amount)) {
-      throw new Error(`Cannot set maxBalance lower than minBalance (${this._minBalance})`)
+      throw new Error(`Cannot set maxBalance less than minBalance (${this._minBalance})`)
     }
     this.debug(`setting maxBalance to ${amount}`)
     this._maxBalance = new BigNumber(amount)
