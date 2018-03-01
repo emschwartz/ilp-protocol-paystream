@@ -423,17 +423,39 @@ describe('PaymentSocket', function () {
       assert.equal(this.serverSocket.getExchangeRate(), '2')
     })
 
-    it('should emit an "error" and reject the stabilized promise if the exchange rate changes too much', async function () {
+    it('should retry packets if the exchange rate gets worse than the exchange rate * (1 + slippage)', async function () {
+      const clock = lolex.install({
+        toFake: ['setTimeout']
+      })
+      const interval = setInterval(() => clock.tick(100))
+
       const spy = sinon.spy()
       this.clientSocket.on('error', spy)
+
       this.clientSocket.setMinAndMaxBalance(-1000)
       await this.clientSocket.stabilized()
 
       this.pluginA.exchangeRate = 0.25
+      let call = 0
+      const realSendData = this.pluginA.sendData.bind(this.pluginA)
+      this.pluginA.sendData = (data: Buffer) => {
+        if (call++ >= 2) {
+          this.pluginA.exchangeRate = 0.495
+          this.pluginA.sendData = realSendData
+        }
+
+        return realSendData(data)
+      }
+
 
       this.clientSocket.setMinAndMaxBalance(-2000)
-      await assert.isRejected(this.clientSocket.stabilized(), 'Exchange rate changed too much, not sending any more. Actual rate: 0.25, expected: 0.5')
-      assert(spy.called)
+      await this.clientSocket.stabilized()
+
+      assert.equal(this.clientSocket.balance, '-2000')
+      assert.equal(this.serverSocket.balance, '995')
+      assert(spy.notCalled)
+
+      clearInterval(interval)
     })
 
     it('should allow the exchange rate to move by the specified slippage', async function () {

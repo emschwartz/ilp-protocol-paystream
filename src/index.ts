@@ -71,7 +71,6 @@ export class PaymentSocket extends EventEmitter {
   protected sending: boolean
   protected shouldSendAddressToPeer: boolean
   protected connected: boolean
-  protected consecutiveRejectedRequests: number
   protected retryTimeout: number
   protected requestId: number
 
@@ -109,7 +108,6 @@ export class PaymentSocket extends EventEmitter {
     this.closed = false
     this.sending = false
     this.connected = false
-    this.consecutiveRejectedRequests = 0
     this.retryTimeout = STARTING_RETRY_TIMEOUT
     this.requestId = 0
     this.debug(`new socket created with minBalance ${this._minBalance}, maxBalance ${this._maxBalance}, slippage: ${this.slippage}, and refunds ${this.enableRefunds ? 'enabled' : 'disabled'}`)
@@ -662,7 +660,6 @@ export class PaymentSocket extends EventEmitter {
       this.emit('chunk')
 
       // This request succeeded to reset our retry-related variables
-      this.consecutiveRejectedRequests = 0
       this.retryTimeout = STARTING_RETRY_TIMEOUT
 
       // Adjust the chunk amount
@@ -718,14 +715,13 @@ export class PaymentSocket extends EventEmitter {
         // Receiver rejected because too little arrived
 
         this.debug(`receiver rejected packet because too little arrived. actual destination amount: ${result.destinationAmount}, expected: ${minDestinationAmount} (sourceAmount: ${sourceAmount}, expected exchange rate: ${this._exchangeRate})`)
-        this.emit('error', new Error(`Exchange rate changed too much, not sending any more. Actual rate: ${destinationAmount.dividedBy(sourceAmount)}, expected: ${this._exchangeRate}`))
 
-        shouldContinue = false
-        this.consecutiveRejectedRequests += 1
+        // Retry in case the rate improves again
+        await new Promise((resolve, reject) => setTimeout(resolve, this.retryTimeout))
+        this.retryTimeout = this.retryTimeout * RETRY_TIMEOUT_INCREASE_FACTOR
       } else if (result.code[0].toUpperCase() === 'T') {
         // Retry on temporary rejection codes
 
-        this.consecutiveRejectedRequests += 1
         this.debug(`got temporary error code: ${result.code}, message: ${result.message}. waiting ${this.retryTimeout}ms before retrying`)
         await new Promise((resolve, reject) => setTimeout(resolve, this.retryTimeout))
         this.retryTimeout = this.retryTimeout * RETRY_TIMEOUT_INCREASE_FACTOR
@@ -734,7 +730,6 @@ export class PaymentSocket extends EventEmitter {
 
         this.debug(`sending chunk failed with code: ${result.code} and message: ${result.message}`)
         this.emit('error', new Error(`Sending chunk failed with code: ${result.code} and message: ${result.message}`))
-        this.consecutiveRejectedRequests += 1
         shouldContinue = false
       }
     }
