@@ -836,7 +836,7 @@ export class PaymentServer {
       plugin: this.plugin,
       destinationAccount,
       sharedSecret: Buffer.concat([SHARED_SECRET_PREFIX, sharedSecret]),
-      identity: 'sever',
+      identity: 'server',
       slippage: (opts.slippage !== undefined ? new BigNumber(opts.slippage) : undefined)
     })
     this.sockets.set(socketId.toString('hex'), socket)
