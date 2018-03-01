@@ -6,6 +6,7 @@ import EventEmitter = require('eventemitter3')
 import * as oer from 'oer-utils'
 import * as Long from 'long'
 import * as assert from 'assert'
+import 'source-map-support/register'
 
 const MAX_UINT64 = new BigNumber('18446744073709551615')
 const DEFAULT_STABILIZED_TIMEOUT = 60000
