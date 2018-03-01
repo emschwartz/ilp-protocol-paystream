@@ -1,5 +1,8 @@
 import 'mocha'
-import { assert } from 'chai'
+import * as chai from 'chai'
+import * as chaiAsPromised from 'chai-as-promised'
+chai.use(chaiAsPromised)
+const assert = chai.assert
 import { createSocket, createServer, PaymentServer, PaymentSocket } from '../src/index'
 import MockPlugin from './mocks/plugin'
 import * as sinon from 'sinon'
@@ -88,13 +91,7 @@ describe('PaymentSocket', function () {
     it('should throw an error if the socket is already closed', async function () {
       await this.clientSocket.connect()
       this.clientSocket.close()
-      let threw = false
-      try {
-        await this.clientSocket.connect()
-      } catch (err) {
-        threw = true
-      }
-      assert(threw)
+      return assert.isRejected(this.clientSocket.connect(), 'Socket is already closed')
     })
 
     it('should allow the user to check if the socket is connected', async function () {
@@ -105,14 +102,7 @@ describe('PaymentSocket', function () {
 
     it('should reject if the other side is closed', async function () {
       await this.serverSocket.close()
-      let threw = false
-      try {
-        await this.clientSocket.connect()
-      } catch (err) {
-        threw = true
-      }
-
-      assert.equal(threw, true)
+      await assert.isRejected(this.clientSocket.connect(), 'Socket is already closed')
     })
 
     it.skip('should timeout after the specified timeout', async function () {
@@ -153,13 +143,7 @@ describe('PaymentSocket', function () {
       this.clientSocket.setMinAndMaxBalance(-1000)
       const notStabilized = this.clientSocket.stabilized()
       clock.tick(100000)
-      let errored = false
-      try {
-        await notStabilized
-      } catch (err) {
-        errored = true
-      }
-      assert(errored)
+      await assert.isRejected(notStabilized, 'Timed out without stabilizing')
       clock.restore()
     })
 
@@ -173,14 +157,7 @@ describe('PaymentSocket', function () {
     it('should reject the stabilized Promise if the other side closes before sending enough money', async function () {
       this.clientSocket.setMinAndMaxBalance(2000)
       setImmediate(() => this.serverSocket.close())
-
-      let errored = false
-      try {
-        await this.clientSocket.stabilized()
-      } catch (err) {
-        errored = true
-      }
-      assert.equal(errored, true)
+      await assert.isRejected(this.clientSocket.stabilized(), 'Sending chunk failed with code: F99 and message:')
     })
   })
 
@@ -220,13 +197,7 @@ describe('PaymentSocket', function () {
 
     it('should reject if the amount is higher than the other party will accept', async function () {
       this.serverSocket.setMaxBalance(900)
-      let errored = false
-      try {
-        await this.clientSocket.pay(2000)
-      } catch (err) {
-        errored = true
-      }
-      assert.equal(errored, true)
+      await assert.isRejected(this.clientSocket.pay(2000), 'Stopped outside of the balance window. Current balance is: -1800, minBalance: -2000, maxBalance: -2000')
     })
 
     it('should resolve when the socket has stabilized, even if the user changed the limits before it did', async function () {
@@ -265,13 +236,7 @@ describe('PaymentSocket', function () {
 
       const notStabilized = this.clientSocket.charge(2000)
       clock.runAll()
-      let errored = false
-      try {
-        await notStabilized
-      } catch (err) {
-        errored = true
-      }
-      assert(errored)
+      await assert.isRejected(notStabilized, 'Timed out without stabilizing')
       clock.uninstall()
     })
 
@@ -343,11 +308,7 @@ describe('PaymentSocket', function () {
     it('should not go above the maxBalance of the other side', async function () {
       this.clientSocket.setMinAndMaxBalance(-2000)
       this.serverSocket.setMaxBalance(750)
-      try {
-        await this.clientSocket.stabilized()
-      } catch (err) {
-      }
-
+      await assert.isRejected(this.clientSocket.stabilized(), 'Stopped outside of the balance window. Current balance is: -1500, minBalance: -2000, maxBalance: -2000')
       assert.equal(this.serverSocket.balance, '750')
     })
   })
@@ -389,14 +350,7 @@ describe('PaymentSocket', function () {
       this.serverSocket.setMinAndMaxBalance(2000)
       this.clientSocket.setMinBalance(-500)
 
-      let errored = false
-      try {
-        await this.serverSocket.stabilized()
-      } catch (err) {
-        errored = true
-      }
-
-      assert(errored)
+      await assert.isRejected(this.serverSocket.stabilized(), 'Requested money from other party but they aren\'t sending it. Current balance: 250, expected: 2000')
       assert(spy.called)
     })
 
@@ -406,11 +360,7 @@ describe('PaymentSocket', function () {
       this.serverSocket.setMinAndMaxBalance(2000)
       this.clientSocket.setMinBalance(-500)
 
-      try {
-        await this.serverSocket.stabilized()
-      } catch (err) {
-      }
-
+      await assert.isRejected(this.serverSocket.stabilized(), 'Requested money from other party but they aren\'t sending it. Current balance: 250, expected: 2000')
       assert.equal(this.clientSocket.balance, '-500')
     })
   })
@@ -428,13 +378,7 @@ describe('PaymentSocket', function () {
 
       const notStabilized = this.clientSocket.stabilized()
       clock.runAll()
-      let errored = false
-      try {
-        await notStabilized
-      } catch (err) {
-        errored = true
-      }
-      assert(errored)
+      await assert.isRejected(notStabilized, 'Timed out without stabilizing')
       assert.equal(this.serverSocket.balance, '500')
       clock.uninstall()
     })
@@ -484,13 +428,7 @@ describe('PaymentSocket', function () {
       this.pluginA.exchangeRate = 0.25
 
       this.clientSocket.setMinAndMaxBalance(-2000)
-      let errored = false
-      try {
-        await this.clientSocket.stabilized()
-      } catch (err) {
-        errored = true
-      }
-      assert(errored)
+      await assert.isRejected(this.clientSocket.stabilized(), 'Exchange rate changed too much, not sending any more. Actual rate: 0.25, expected: 0.5')
       assert(spy.called)
     })
 
@@ -601,13 +539,7 @@ describe('PaymentSocket', function () {
       this.pluginA.maxAmount = 0
       const spy = sinon.spy(this.pluginA, 'sendData')
       this.clientSocket.setMinAndMaxBalance(-15000)
-      let errored = false
-      try {
-        await this.clientSocket.stabilized()
-      } catch (err) {
-        errored = true
-      }
-      assert.equal(errored, true)
+      await assert.isRejected(this.clientSocket.stabilized(), 'Cannot send through this path because the maximum packet amount appears to be zero')
       assert.equal(spy.callCount, 1)
     })
 
@@ -649,15 +581,8 @@ describe('PaymentSocket', function () {
 
       this.clientSocket.setMinAndMaxBalance(-2000)
 
-      let errored = false
-      try {
-        await this.clientSocket.stabilized()
-      } catch (err) {
-        errored = true
-      }
-
+      await assert.isRejected(this.clientSocket.stabilized(), 'Sending chunk failed with code: F00 and message: Bad Request')
       assert.equal(sendDataStub.callCount, 2)
-      assert.equal(errored, true)
       assert.equal(spy.callCount, 1)
     })
 
@@ -689,10 +614,7 @@ describe('PaymentSocket', function () {
         }))
 
       clientSocket.setMinAndMaxBalance(-1000)
-      try {
-        await clientSocket.stabilized()
-      } catch (err) {
-      }
+      await assert.isRejected(clientSocket.stabilized(), 'Sending chunk failed with code: T00 and message: Internal Server Error. Retried 7 times but each was rejected')
 
       assert.equal(sendDataStub.callCount, 7)
       assert.equal(spy.callCount, 1)
@@ -724,18 +646,11 @@ describe('PaymentServer', function () {
 
       await serverSocket.close()
 
-      let errored = false
-      try {
-        await createSocket({
-          plugin: this.pluginA,
-          sharedSecret: serverSocket.sharedSecret,
-          destinationAccount: serverSocket.destinationAccount
-        })
-      } catch (err) {
-        errored = true
-      }
-
-      assert.equal(errored, true)
+      await assert.isRejected(createSocket({
+        plugin: this.pluginA,
+        sharedSecret: serverSocket.sharedSecret,
+        destinationAccount: serverSocket.destinationAccount
+      }), 'Peer closed connection')
     })
   })
 
@@ -801,17 +716,10 @@ describe('Client Socket (createSocket)', function () {
     })
     const { destinationAccount, sharedSecret } = receiver.generateAddressAndSecret()
 
-    let errored = false
-    try {
-      await createSocket({
-        plugin: this.pluginA,
-        destinationAccount,
-        sharedSecret
-      })
-    } catch (err) {
-      errored = true
-    }
-
-    assert.equal(errored, true)
+    await assert.isRejected(createSocket({
+      plugin: this.pluginA,
+      destinationAccount,
+      sharedSecret
+    }), 'Shared secret and destination account are not for a Payment Socket (must start with "payment-socket:")')
   })
 })
